@@ -5,12 +5,13 @@ try:
 except Exception:
     cm = None
 
-class MaxHMM:
-    def __init__(self, num_nodes, num_sites, mu, rho):
+class LSHMM:
+    def __init__(self, num_nodes, num_sites, mu, rho, scale_by_n=False):
         self.num_nodes = num_nodes
         self.num_sites = num_sites
         self.mu = mu
         self.rho = rho
+        self.scale_by_n = scale_by_n
         self.L_norm_mat = np.zeros((num_nodes, num_sites), dtype=float)
         self.L_mat = np.zeros((num_nodes, num_sites), dtype=float)
         self.L = np.full(self.num_nodes, 1.0)
@@ -32,18 +33,28 @@ class MaxHMM:
     def update_site(self, site):
         max_L = -1
         max_L_node = -1
+        rho = self.rho
+        mu = self.mu
+        if self.scale_by_n:
+            n = self.num_nodes
+        else:
+            n = 1
         
         for u in range(self.num_nodes):
-            if self.L[u] > self.rho:
-                p_recomb = self.L[u]
+            p_last = self.L[u]
+            p_no_recomb = p_last * (1 - rho + rho / n)
+            p_recomb = rho / n
+            if p_no_recomb > p_recomb:
+                p_transition = p_no_recomb
             else:
-                p_recomb = self.rho
+                p_transition = p_recomb
                 self.recomb_required[u, site] = True
-            p_emission = self.mu
+
+            p_emission = mu
             if self.query[site] == self.reference[u, site]:
                 self.mismatch[u, site] = False
                 p_emission = 1 - self.mu
-            self.L[u] = p_recomb * p_emission
+            self.L[u] = p_transition * p_emission
             self.L_mat[u, site] = self.L[u]
             if self.L[u] > max_L:
                 max_L = self.L[u]
@@ -58,11 +69,9 @@ class MaxHMM:
             self.L[u] = L_norm
             self.L_norm_mat[u, site] = L_norm
 
-    def run_forward(self):
+    def run(self):
         for site in range(0, self.num_sites):
             self.update_site(site)
-
-    def run_backtrace(self):
         path = []
         num_switches = 0
         num_mismatches = 0
@@ -83,16 +92,13 @@ class MaxHMM:
         self.path_likelihood = self.rho**num_switches * self.mu**num_mismatches
     
 
-from IPython.display import HTML, display
-import numpy as np
-
 class HMMViz:
     def __init__(
         self,
         hmm,
         label_col_width=100,
-        top_axis_height=35,
-        top_margin=8,
+        top_axis_height=42,
+        top_margin=12,
         cell_width=67,
         cell_height=67,
         like_height=19,
@@ -127,6 +133,11 @@ class HMMViz:
             return str(x)
         s = f"{x:.5f}".rstrip("0").rstrip(".")
         return s if s else "0"
+
+    def _fmt_sci(self, x):
+        if not np.isfinite(x):
+            return str(x)
+        return f"{x:.3e}"
 
     def _text_color_for_fill(self, fill):
         if not fill or not fill.startswith("#"):
@@ -178,7 +189,7 @@ class HMMViz:
         extra_right = 50
         if getattr(self.hmm, "path", None):
             box_gap = self.col_gap * 0.6
-            summary_w = self.cell_width * 3.5
+            summary_w = self.cell_width * 3.8
             extra_right = box_gap + summary_w
         total_width = (
             self.label_col_width + self.num_sites * col_span - self.col_gap + extra_right
@@ -198,7 +209,7 @@ class HMMViz:
         x_center = self.label_col_width + (self.num_sites * col_span - self.col_gap) / 2
         parts.append(
             f'<text x="{x_center}" y="{self.top_axis_height * 0.40}" text-anchor="middle" '
-            f'alignment-baseline="middle" font-size="22">Sites</text>'
+            f'alignment-baseline="middle" font-size="22">Site</text>'
         )
         y_center = nodes_top + nodes_h / 2
         parts.append(
@@ -259,11 +270,11 @@ class HMMViz:
                     parts.append(
                         f'<rect x="{x}" y="{y_like + self.like_height}" '
                         f'width="{self.cell_width}" height="{self.like_geno_gap}" '
-                        f'fill="orange" stroke="none" />'
+                        f'fill="orange" stroke="orange" stroke-width="1" />'
                     )
 
                 is_mismatch = bool(self.hmm.mismatch[u, s])
-                g_fill = "#eeeeee" if is_mismatch else "white"
+                g_fill =  "white" if is_mismatch else "#dddddd"
                 g_color = "red" if is_mismatch else "black"
                 self.draw_cell(
                     parts,
@@ -285,7 +296,7 @@ class HMMViz:
         parts.append(
             f'<rect x="{query_x0 - query_pad}" y="{query_y - query_pad}" '
             f'width="{query_w + 2 * query_pad}" height="{self.cell_height + 2 * query_pad}" '
-            f'fill="#666666" stroke="none" />'
+            f'fill="black" stroke="none" />'
         )
         parts.append(
             f'<text x="{row_label_x}" y="{query_y + self.cell_height/2}" text-anchor="end" '
@@ -302,6 +313,7 @@ class HMMViz:
                 text=str(int(self.hmm.query[s])),
                 font_size=int(self.cell_height * 0.65),
                 stroke_width=1,
+                fill="#dddddd",
             )
 
         # Viterbi path overlay (genotype cells)
@@ -357,7 +369,7 @@ class HMMViz:
                 y_last = nodes_top + u_last * row_span + self.like_text_height + self.like_height + self.like_geno_gap
                 yc_last = y_last + self.cell_height / 2
                 box_gap = self.col_gap * 0.6
-                summary_w = self.cell_width * 2.5
+                summary_w = self.cell_width * 3.8
                 line_h = self.cell_height * 0.40
                 pad_y = self.cell_height * 0.12
                 summary_h = line_h * 3 + pad_y * 2
@@ -376,7 +388,7 @@ class HMMViz:
                 summary_rows = [
                     ("num_switches", str(self.hmm.num_switches)),
                     ("num_mismatches", str(self.hmm.num_mismatches)),
-                    ("path_likelihood", self._fmt(self.hmm.path_likelihood)),
+                    ("path_likelihood", self._fmt_sci(self.hmm.path_likelihood)),
                 ]
                 text_x = summary_x + summary_w * 0.06
                 for i, (label, value) in enumerate(summary_rows):
