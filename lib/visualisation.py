@@ -168,23 +168,50 @@ def plot_ancestor_boxplot(
 
 
 def plot_path_likelihood(
-    df, path_id, likelihood_threshold=1e-13, cmap="viridis", figsize=(14, 8)
+    df,
+    path_id,
+    likelihood_threshold=1e-13,
+    cmap="viridis",
+    figsize=(14, 8),
+    weight_by_n=None,
+    mismatch_ratio=None,
+    compared_by=None,
+    long_df=None,
 ):
     """
     Plot per-site likelihood structure for a single path.
 
-    The main pane is a rectangular heatmap where each site column is split into
-    k blocks (one per likelihood value). Block heights vary as 1/k so each column
-    spans the same total height. A lower pane shows k per site as a simple box/bar
-    track at half height relative to the heatmap.
+    If ``long_df`` is supplied, it is used directly (after filtering) to avoid
+    rebuilding long-form likelihood rows on every redraw.
     """
     from likelihoods import make_long_df
+
+    def _filter_by_params(frame):
+        frame = frame.copy()
+        if weight_by_n is not None and "weight_by_n" in frame.columns:
+            frame = frame.loc[frame["weight_by_n"] == weight_by_n]
+        if mismatch_ratio is not None and "mismatch_ratio" in frame.columns:
+            mismatch_values = pd.to_numeric(frame["mismatch_ratio"], errors="coerce")
+            frame = frame.loc[
+                np.isclose(mismatch_values, float(mismatch_ratio), equal_nan=False)
+            ]
+        if "likelihood_threshold" in frame.columns:
+            threshold_values = pd.to_numeric(
+                frame["likelihood_threshold"], errors="coerce"
+            )
+            frame = frame.loc[
+                np.isclose(
+                    threshold_values, float(likelihood_threshold), equal_nan=False
+                )
+            ]
+        return frame
 
     df = pd.DataFrame(df, copy=False)
     if "path_id" not in df.columns:
         raise ValueError("DataFrame must contain 'path_id'")
 
-    subset_df = df.loc[df["path_id"] == path_id].copy()
+    filtered_df = _filter_by_params(df)
+    subset_df = filtered_df.loc[filtered_df["path_id"] == path_id].copy()
     if len(subset_df) == 0:
         raise ValueError(f"No rows found for path_id={path_id}")
 
@@ -197,15 +224,23 @@ def plot_path_likelihood(
     if len(site_rows) == 0:
         raise ValueError(f"No sites found for path_id={path_id}")
 
-    long_df = make_long_df(subset_df)
-    long_df = long_df.sort_values(
+    if long_df is None:
+        long_subset = make_long_df(subset_df)
+    else:
+        long_all = pd.DataFrame(long_df, copy=False)
+        if "path_id" not in long_all.columns:
+            raise ValueError("Provided long_df must contain 'path_id'")
+        long_subset = long_all.loc[long_all["path_id"] == path_id]
+        long_subset = _filter_by_params(long_subset)
+
+    long_subset = long_subset.sort_values(
         ["site", "full_likelihood", "likelihood_node_id"],
         kind="mergesort",
     ).reset_index(drop=True)
 
     grouped_likelihoods = {
         site: grp["full_likelihood"].to_numpy(dtype=np.float64, copy=False)
-        for site, grp in long_df.groupby("site", sort=False)
+        for site, grp in long_subset.groupby("site", sort=False)
     }
 
     polygons = []
@@ -289,7 +324,26 @@ def plot_path_likelihood(
 
     child_ids = subset_df["child_id"].dropna().unique()
     child_label = child_ids[0] if len(child_ids) > 0 else "NA"
-    ax_heat.set_title(f"Path {path_id} (child_id={child_label})")
+
+    def _format_param(name, value):
+        if isinstance(value, (float, np.floating)):
+            value_str = f"{float(value):.3g}"
+        else:
+            value_str = str(value)
+        label = f"{name}={value_str}"
+        if compared_by == name:
+            math_label = label.replace("_", r"\_")
+            return rf"$\bf{{{math_label}}}$"
+        return label
+
+    title_parts = [f"Path {path_id} (child_id={child_label})"]
+    if "weight_by_n" in subset_df.columns:
+        title_parts.append(_format_param("weight_by_n", bool(subset_df["weight_by_n"].iloc[0])))
+    if "mismatch_ratio" in subset_df.columns:
+        title_parts.append(_format_param("mismatch_ratio", float(subset_df["mismatch_ratio"].iloc[0])))
+    if "likelihood_threshold" in subset_df.columns:
+        title_parts.append(_format_param("likelihood_threshold", float(subset_df["likelihood_threshold"].iloc[0])))
+    ax_heat.set_title(" | ".join(title_parts))
 
     site_to_x = {site: idx + 0.5 for idx, site in enumerate(site_values)}
     mismatch_sites = (
@@ -309,7 +363,7 @@ def plot_path_likelihood(
     for site in recombination_sites:
         x = site_to_x.get(site)
         if x is not None:
-            ax_heat.axvline(x, color="orange", linewidth=1.2, alpha=0.95)
+            ax_heat.axvline(x, color="#ff69b4", linewidth=1.2, alpha=0.95)
 
     ax_k.bar(
         np.arange(len(site_rows)),
@@ -321,6 +375,7 @@ def plot_path_likelihood(
     )
     ax_k.set_ylabel("Num. tracked nodes")
     ax_k.set_xlabel("Site")
+    ax_k.set_yscale("log")
     positive_k = k_values[k_values > 0]
     if len(positive_k) > 0:
         ax_k.set_ylim(bottom=max(0.8, float(np.min(positive_k)) * 0.8))
@@ -363,7 +418,7 @@ def plot_path_likelihood(
 
     threshold_label = np.format_float_scientific(likelihood_threshold, precision=0)
     high_cbar.set_ticks([legend_min, high_vmax])
-    high_cbar.set_ticklabels([f"{threshold_label} + ε", f"{high_vmax:.2g}"])
+    high_cbar.set_ticklabels([f"{threshold_label}\n+ ε", f"{high_vmax:.2g}"])
 
     threshold_ax = fig.add_axes([legend_x, threshold_y, legend_width, threshold_height])
     threshold_ax.add_patch(
@@ -382,13 +437,21 @@ def plot_path_likelihood(
         transform=threshold_ax.transAxes,
     )
 
+    num_mismatches = int((subset_df["selected_mismatch"] > 0).sum())
+    num_recombinations = int((subset_df["selected_recombination"] > 0).sum())
     handles = [
-        Line2D([0], [0], color="red", lw=1.8, label="mismatch"),
-        Line2D([0], [0], color="orange", lw=1.8, label="recombination"),
+        Line2D([0], [0], color="red", lw=1.8, label=f"mismatch (n={num_mismatches})"),
+        Line2D(
+            [0],
+            [0],
+            color="#ff69b4",
+            lw=1.8,
+            label=f"recombination (n={num_recombinations})",
+        ),
     ]
     event_height = total_height * 0.14
     event_y = max(bottom, threshold_y - total_height * 0.20)
-    event_ax = fig.add_axes([legend_x, event_y, 0.16, event_height])
+    event_ax = fig.add_axes([legend_x, event_y, 0.20, event_height])
     event_ax.set_axis_off()
     event_ax.legend(
         handles=handles,
@@ -399,3 +462,220 @@ def plot_path_likelihood(
     )
 
     plt.show()
+
+
+def plot_paths_interactively(df):
+    """
+    Interactive viewer over a combined dataframe with multiple parameter settings.
+
+    - Builds path summary sorted by num_errors.
+    - Slider is global path_id (0..max path_id) and does not change with params.
+    - Parameter selectors fix non-compared parameters.
+    - Compare-by selector plots one column per value of selected compare variable.
+    """
+    try:
+        import ipywidgets as widgets
+        from IPython.display import display
+    except ImportError as exc:
+        raise ImportError(
+            "plot_paths_interactively requires ipywidgets and IPython display"
+        ) from exc
+
+    from likelihoods import make_long_df, summarise_paths
+
+    combined_df = pd.DataFrame(df, copy=False)
+    required = {
+        "path_id",
+        "weight_by_n",
+        "mismatch_ratio",
+        "likelihood_threshold",
+        "k",
+    }
+    missing = required.difference(combined_df.columns)
+    if missing:
+        missing_str = ", ".join(sorted(missing))
+        raise ValueError(
+            "DataFrame missing required columns for interactive view: "
+            f"{missing_str}"
+        )
+
+    path_df = summarise_paths(combined_df).sort_values(
+        ["num_errors", "path_id"], kind="mergesort"
+    ).reset_index(drop=True)
+
+    # Build long dataframe once for all updates.
+    long_base = make_long_df(combined_df)
+    repeats = combined_df["k"].to_numpy(dtype=np.int64, copy=False)
+    long_base["path_id"] = np.repeat(
+        combined_df["path_id"].to_numpy(copy=False), repeats
+    )
+    for col in ["weight_by_n", "mismatch_ratio", "likelihood_threshold"]:
+        if col in combined_df.columns:
+            long_base[col] = np.repeat(combined_df[col].to_numpy(copy=False), repeats)
+
+    def _fmt_value(v):
+        if isinstance(v, (float, np.floating)):
+            return np.format_float_scientific(float(v), precision=2)
+        return str(v)
+
+    weight_values = [bool(v) for v in pd.unique(combined_df["weight_by_n"])]
+    ordered_weights = [v for v in [True, False] if v in set(weight_values)]
+    ordered_weights.extend([v for v in weight_values if v not in set(ordered_weights)])
+
+    mismatch_values = sorted(float(v) for v in pd.unique(combined_df["mismatch_ratio"]))
+    threshold_values = sorted(
+        float(v) for v in pd.unique(combined_df["likelihood_threshold"])
+    )
+
+    weight_buttons = widgets.ToggleButtons(
+        options=[(str(v), v) for v in ordered_weights],
+        description="weight_by_n",
+    )
+    mismatch_buttons = widgets.ToggleButtons(
+        options=[(_fmt_value(v), v) for v in mismatch_values],
+        description="mismatch_ratio",
+    )
+    threshold_buttons = widgets.ToggleButtons(
+        options=[(_fmt_value(v), v) for v in threshold_values],
+        description="likelihood_threshold",
+    )
+    compare_buttons = widgets.ToggleButtons(
+        options=[
+            ("weight_by_n", "weight_by_n"),
+            ("mismatch_ratio", "mismatch_ratio"),
+            ("likelihood_threshold", "likelihood_threshold"),
+        ],
+        description="Compare by",
+    )
+
+    max_path_id = int(pd.to_numeric(combined_df["path_id"], errors="coerce").max())
+    slider = widgets.IntSlider(
+        value=0,
+        min=0,
+        max=max_path_id,
+        step=1,
+        description="path_id",
+        continuous_update=False,
+        readout=True,
+        layout=widgets.Layout(width="95%"),
+    )
+
+    status = widgets.HTML()
+    output = widgets.Output()
+
+    controls_row = widgets.HBox(
+        [weight_buttons, mismatch_buttons, threshold_buttons],
+        layout=widgets.Layout(width="100%"),
+    )
+    compare_row = widgets.HBox([compare_buttons], layout=widgets.Layout(width="100%"))
+    ui = widgets.VBox([output, slider, controls_row, compare_row, status])
+
+    def _get_compare_values(name):
+        if name == "weight_by_n":
+            return ordered_weights
+        if name == "mismatch_ratio":
+            return mismatch_values
+        if name == "likelihood_threshold":
+            return threshold_values
+        raise ValueError(f"Unknown compare variable: {name}")
+
+    def _parameter_set(compare_name, compare_value):
+        params = {
+            "weight_by_n": weight_buttons.value,
+            "mismatch_ratio": float(mismatch_buttons.value),
+            "likelihood_threshold": float(threshold_buttons.value),
+        }
+        params[compare_name] = compare_value
+        return params
+
+    def _find_summary_row(path_id, params):
+        subset = path_df.loc[path_df["path_id"] == path_id]
+        subset = subset.loc[subset["weight_by_n"] == params["weight_by_n"]]
+        subset = subset.loc[
+            np.isclose(
+                pd.to_numeric(subset["mismatch_ratio"], errors="coerce"),
+                float(params["mismatch_ratio"]),
+                equal_nan=False,
+            )
+        ]
+        subset = subset.loc[
+            np.isclose(
+                pd.to_numeric(subset["likelihood_threshold"], errors="coerce"),
+                float(params["likelihood_threshold"]),
+                equal_nan=False,
+            )
+        ]
+        if len(subset) == 0:
+            return None
+        return subset.iloc[0]
+
+    def draw_current():
+        path_id = int(slider.value)
+        compare_name = compare_buttons.value
+        compare_values = _get_compare_values(compare_name)
+
+        panel_outputs = []
+        status_parts = []
+
+        for value in compare_values:
+            params = _parameter_set(compare_name, value)
+            label = f"{compare_name}={_fmt_value(value)}"
+            panel = widgets.Output(layout=widgets.Layout(width=f"{max(30, int(98 / max(1, len(compare_values))))}%"))
+
+            with panel:
+                row = _find_summary_row(path_id, params)
+                if row is None:
+                    print(f"{label}: no row for path_id={path_id}")
+                else:
+                    status_parts.append(
+                        f"{label}: errors={int(row['num_errors'])}, "
+                        f"switches={int(row['num_switches'])}, "
+                        f"mismatches={int(row['num_mismatches'])}"
+                    )
+                    plot_path_likelihood(
+                        combined_df,
+                        path_id=path_id,
+                        likelihood_threshold=float(params["likelihood_threshold"]),
+                        weight_by_n=bool(params["weight_by_n"]),
+                        mismatch_ratio=float(params["mismatch_ratio"]),
+                        compared_by=compare_name,
+                        long_df=long_base,
+                    )
+            panel_outputs.append(panel)
+
+        with output:
+            output.clear_output(wait=True)
+            display(widgets.HBox(panel_outputs, layout=widgets.Layout(width="100%")))
+
+        if len(status_parts) == 0:
+            status.value = f"<b>path_id {path_id}</b>: no matching rows"
+        else:
+            status.value = (
+                f"<b>path_id {path_id}</b> &nbsp;|&nbsp; "
+                + " &nbsp;|&nbsp; ".join(status_parts)
+            )
+
+    def _on_change(change):
+        if change.get("name") == "value":
+            draw_current()
+
+    slider.observe(_on_change, names="value")
+    weight_buttons.observe(_on_change, names="value")
+    mismatch_buttons.observe(_on_change, names="value")
+    threshold_buttons.observe(_on_change, names="value")
+    compare_buttons.observe(_on_change, names="value")
+
+    draw_current()
+    display(ui)
+
+    return {
+        "ui": ui,
+        "path_df": path_df,
+        "long_df": long_base,
+        "slider": slider,
+        "weight_buttons": weight_buttons,
+        "mismatch_buttons": mismatch_buttons,
+        "threshold_buttons": threshold_buttons,
+        "compare_buttons": compare_buttons,
+    }
+
