@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import os
 import sys
+import concurrent.futures
+import itertools
 tsinfer_path = os.path.abspath("/home/duncan/trees/tsinfer")
 modules_path = os.path.abspath("/home/duncan/trees/tsinfer-paper/lib")
 sys.path.append(modules_path)
@@ -12,6 +14,15 @@ import likelihoods
 import real_data
 import struct
 import msprime
+import math
+
+
+SWITCH_CAUSE_NAMES = {
+    0: "none",
+    1: "forced_end",
+    2: "score_driven",
+    3: "ambiguous",
+}
 
 
 def load_hmm_log(path, likelihood_threshold=1e-13):
@@ -23,8 +34,8 @@ def load_hmm_log(path, likelihood_threshold=1e-13):
     if data[:8] != b"TSILHMML":
         raise ValueError(f"Bad magic: {data[:8]!r}")
     version = struct.unpack_from("<I", data, 8)[0]
-    if version != 6:
-        raise ValueError(f"Unsupported version: {version}. Expected version 6.")
+    if version != 7:
+        raise ValueError(f"Unsupported version: {version}. Expected version 7.")
 
     view = memoryview(data)
     path_begin_child_id = {}
@@ -84,14 +95,20 @@ def load_hmm_log(path, likelihood_threshold=1e-13):
                 _, _, _ = struct.unpack_from("<QiQ", data, pos)
                 pos += 20
             elif rec_type == 4:  # SELECTED_NODE
-                path_id, site, selected_node, selected_mismatch, selected_recombination = (
-                    struct.unpack_from("<Qiibb", data, pos)
-                )
-                pos += 18
+                (
+                    path_id,
+                    site,
+                    selected_node,
+                    selected_mismatch,
+                    selected_recombination,
+                    selected_switch_cause,
+                ) = struct.unpack_from("<Qiibbb", data, pos)
+                pos += 19
                 selected_map[(path_id, site)] = (
                     selected_node,
                     selected_mismatch,
                     selected_recombination,
+                    selected_switch_cause,
                 )
             else:
                 raise ValueError(f"Unknown record type: {rec_type}")
@@ -114,6 +131,7 @@ def load_hmm_log(path, likelihood_threshold=1e-13):
                 "selected_node": pd.Series(dtype=np.int32),
                 "selected_mismatch": pd.Series(dtype=np.int8),
                 "selected_recombination": pd.Series(dtype=np.int8),
+                "selected_switch_cause": pd.Series(dtype=object),
                 "child_id": pd.Series(dtype=np.int32),
                 "child_time": pd.Series(dtype=np.float64),
                 "prop_min_likelihood": pd.Series(dtype=np.float64),
@@ -124,12 +142,23 @@ def load_hmm_log(path, likelihood_threshold=1e-13):
         selected_node = np.full(n_sites, -1, dtype=np.int32)
         selected_mismatch = np.full(n_sites, -1, dtype=np.int8)
         selected_recombination = np.full(n_sites, -1, dtype=np.int8)
+        selected_switch_cause_code = np.zeros(n_sites, dtype=np.uint8)
         for index, (path_id, site) in enumerate(zip(site_path_ids, site_sites)):
             values = selected_map.get((path_id, site))
             if values is not None:
                 selected_node[index] = values[0]
                 selected_mismatch[index] = values[1]
                 selected_recombination[index] = values[2]
+                selected_switch_cause_code[index] = values[3]
+
+        selected_switch_cause = np.fromiter(
+            (
+                SWITCH_CAUSE_NAMES.get(int(code), f"unknown_{int(code)}")
+                for code in selected_switch_cause_code
+            ),
+            dtype=object,
+            count=n_sites,
+        )
 
         child_id = np.fromiter(
             (path_begin_child_id.get(path_id, -1) for path_id in site_path_ids),
@@ -153,6 +182,7 @@ def load_hmm_log(path, likelihood_threshold=1e-13):
                 "selected_node": selected_node,
                 "selected_mismatch": selected_mismatch,
                 "selected_recombination": selected_recombination,
+                "selected_switch_cause": selected_switch_cause,
                 "child_id": child_id,
                 "child_time": child_time,
                 "prop_min_likelihood": np.asarray(
@@ -174,7 +204,7 @@ def summarise_paths(df):
     Aggregate per-site HMM log rows into one row per path_id and parameter combo.
 
     If present in the input, parameter columns
-    ("weight_by_n", "mismatch_ratio", "likelihood_threshold")
+    ("weight_by_n", "mu", "rho", "likelihood_threshold")
     are included in grouping and output.
     """
     df = pd.DataFrame(df, copy=False)
@@ -182,6 +212,7 @@ def summarise_paths(df):
         "path_id",
         "child_id",
         "selected_recombination",
+        "selected_switch_cause",
         "selected_mismatch",
         "num_max_likelihood",
         "num_min_likelihood",
@@ -196,7 +227,7 @@ def summarise_paths(df):
 
     parameter_columns = [
         col
-        for col in ["weight_by_n", "mismatch_ratio", "likelihood_threshold"]
+        for col in ["weight_by_n", "mu", "rho", "likelihood_threshold"]
         if col in df.columns
     ]
     group_columns = ["path_id", *parameter_columns]
@@ -206,6 +237,9 @@ def summarise_paths(df):
             "path_id": pd.Series(dtype=np.uint64),
             "child_id": pd.Series(dtype=np.int32),
             "num_switches": pd.Series(dtype=np.int64),
+            "num_switches_forced_end": pd.Series(dtype=np.int64),
+            "num_switches_score_driven": pd.Series(dtype=np.int64),
+            "num_switches_ambiguous": pd.Series(dtype=np.int64),
             "num_mismatches": pd.Series(dtype=np.int64),
             "num_errors": pd.Series(dtype=np.int64),
             "prop_tie_breaks": pd.Series(dtype=np.float64),
@@ -223,6 +257,9 @@ def summarise_paths(df):
             *parameter_columns,
             "child_id",
             "num_switches",
+            "num_switches_forced_end",
+            "num_switches_score_driven",
+            "num_switches_ambiguous",
             "num_mismatches",
             "num_errors",
             "prop_tie_breaks",
@@ -260,6 +297,10 @@ def summarise_paths(df):
         df["num_max_likelihood"].to_numpy(dtype=np.int64, copy=False) > 1,
         index=df.index,
     )
+    switch_cause = pd.Series(
+        df["selected_switch_cause"].to_numpy(dtype=object, copy=False),
+        index=df.index,
+    )
 
     group_keys = [df[col] for col in group_columns]
 
@@ -275,6 +316,24 @@ def summarise_paths(df):
     summary["num_switches"] = (
         switch_flag.groupby(group_keys, sort=False).sum().astype(np.int64)
     )
+    summary["num_switches_forced_end"] = (
+        ((switch_cause == "forced_end") & switch_flag)
+        .groupby(group_keys, sort=False)
+        .sum()
+        .astype(np.int64)
+    )
+    summary["num_switches_score_driven"] = (
+        ((switch_cause == "score_driven") & switch_flag)
+        .groupby(group_keys, sort=False)
+        .sum()
+        .astype(np.int64)
+    )
+    summary["num_switches_ambiguous"] = (
+        ((switch_cause == "ambiguous") & switch_flag)
+        .groupby(group_keys, sort=False)
+        .sum()
+        .astype(np.int64)
+    )
     summary["num_mismatches"] = (
         mismatch_flag.groupby(group_keys, sort=False).sum().astype(np.int64)
     )
@@ -287,6 +346,9 @@ def summarise_paths(df):
         *parameter_columns,
         "child_id",
         "num_switches",
+        "num_switches_forced_end",
+        "num_switches_score_driven",
+        "num_switches_ambiguous",
         "num_mismatches",
         "num_errors",
         "prop_tie_breaks",
@@ -300,48 +362,29 @@ def summarise_paths(df):
     return summary[ordered]
 
 
-def build_maps(ancestors_ts, mismatch_ratio, recomb_map):
-    mismatch_ratio = float(mismatch_ratio)
-    if mismatch_ratio > 0:
-        inference_pos = ancestors_ts.tables.sites.position
-        rate_map = msprime.RateMap.read_hapmap(recomb_map, position_col=1, rate_col=2)
-        genetic_dists = tsinfer.Matcher.recombination_rate_to_dist(
-            rate_map, inference_pos
-        )
-        recombination_map = tsinfer.Matcher.recombination_dist_to_prob(genetic_dists)
-        # Set 0 probabilities to a small value
-        recombination_map[recombination_map == 0] = 1e-19
-        mismatch_ratio = mismatch_ratio
-        num_alleles = 2
-        mismatch_map = np.full(
-            len(inference_pos),
-            tsinfer.Matcher.mismatch_ratio_to_prob(
-                mismatch_ratio, np.median(genetic_dists), num_alleles
-            ),
-        )
-    else:
-        recombination_map = None
-        mismatch_map = None
-    return recombination_map, mismatch_map
-
-
-
 def run_1kgp_inference(subset_num_sites,
                         subset_num_samples,
                         output_path,
                         weight_by_n=True,
-                        mismatch=0,
-                        recomb_map="/home/duncan/trees/tsinfer-paper/data/HapMapII_GRCh38/genetic_map_Hg38_chr17.txt",
+                        mu=1e-20,
+                        rho=1e-2,
                         likelihood_threshold=1e-13,
                         zarr_path="/home/duncan/trees/tsinfer-paper/data/chr17/data.zarr/",
                         region_mask_name="variant_all_subset_chr17p_region_filterNton23_site_density_threshold_sites_per_kbp_5_window_size_100000_mask",
                         store_likelihoods=False,
+                        run_label=None,
+                        likelihoods_csv_path=None,
+                        return_df=True,
                         ):
     
 
     wbn = "on" if weight_by_n else "off"
+    run_label_str = "" if run_label is None else f"_{str(run_label).replace(os.sep, '_')}"
     def make_path(filename):
-        name = f"subset_s{subset_num_sites}_n{subset_num_samples}_mm{mismatch}_wbn_{wbn}_{filename}"
+        name = (
+            f"subset_s{subset_num_sites}_n{subset_num_samples}_mu{mu}_rho{rho}"
+            f"_wbn_{wbn}{run_label_str}_{filename}"
+        )
         return os.path.join(output_path, name)
     
     variant_data = real_data.make_1kgp_variant_data(subset_num_sites,
@@ -361,7 +404,10 @@ def run_1kgp_inference(subset_num_sites,
         hmm_likelihood_log=make_path("match_ancestors.bin"),
     )
     ancestors_ts.dump(make_path("ancestors.trees"))
-    recombination_map, mismatch_map = build_maps(ancestors_ts, mismatch, recomb_map)
+
+    num_sites = ancestors_ts.num_sites
+    recombination = np.full(num_sites-1, rho)
+    mismatch = np.full(num_sites, mu)
     ts = tsinfer.match_samples(
         variant_data,
         ancestors_ts,
@@ -369,8 +415,8 @@ def run_1kgp_inference(subset_num_sites,
         hmm_likelihood_log=make_path("match_samples.bin"),
         weight_by_n=weight_by_n,
         likelihood_threshold=likelihood_threshold,
-        recombination=recombination_map,
-        mismatch=mismatch_map
+        recombination=recombination,
+        mismatch=mismatch
     )
     ts.dump(make_path("final.trees"))
 
@@ -379,22 +425,35 @@ def run_1kgp_inference(subset_num_sites,
         make_path("match_samples.bin"),
         likelihood_threshold=likelihood_threshold,
     )
-    df["mismatch_ratio"] = mismatch
+    df["mu"] = float(mu)
+    df["rho"] = float(rho)
     df["weight_by_n"] = weight_by_n
     df["likelihood_threshold"] = likelihood_threshold
+    csv_path = (
+        make_path("likelihoods.csv")
+        if likelihoods_csv_path is None
+        else likelihoods_csv_path
+    )
     if store_likelihoods:
         print('Writing dataframe to disk')
-        df.to_csv(make_path(f"likelihoods.csv"), index=None)
+        csv_dir = os.path.dirname(csv_path)
+        if csv_dir != "":
+            os.makedirs(csv_dir, exist_ok=True)
+        df.to_csv(csv_path, index=None)
 
-    return df
+    if return_df:
+        return df
+    if store_likelihoods:
+        return csv_path
+    return None
 
 
 def run_1kgp_comparison(subset_num_sites,
                         subset_num_samples,
                         output_path,
                         weight_by_n_array=None,
-                        mismatch_array=None,
-                        recomb_map="/home/duncan/trees/tsinfer-paper/data/HapMapII_GRCh38/genetic_map_Hg38_chr17.txt",
+                        mu_array=None,
+                        rho_array=None,
                         likelihood_threshold_array=None,
                         zarr_path="/home/duncan/trees/tsinfer-paper/data/chr17/data.zarr/",
                         region_mask_name="variant_all_subset_chr17p_region_filterNton23_site_density_threshold_sites_per_kbp_5_window_size_100000_mask",
@@ -402,8 +461,10 @@ def run_1kgp_comparison(subset_num_sites,
                         ):
     if weight_by_n_array is None:
         weight_by_n_array = [True]
-    if mismatch_array is None:
-        mismatch_array = [0]
+    if mu_array is None:
+        mu_array = [1e-20]
+    if rho_array is None:
+        rho_array = [1e-2]
     if likelihood_threshold_array is None:
         likelihood_threshold_array = [1e-13]
     if store_likelihoods:
@@ -413,39 +474,155 @@ def run_1kgp_comparison(subset_num_sites,
         )
 
     weight_by_n_values = list(weight_by_n_array)
-    mismatch_values = list(mismatch_array)
+    mu_values = list(mu_array)
+    rho_values = list(rho_array)
     likelihood_threshold_values = list(likelihood_threshold_array)
 
     if len(weight_by_n_values) == 0:
         raise ValueError("weight_by_n_array must contain at least one value")
-    if len(mismatch_values) == 0:
-        raise ValueError("mismatch_array must contain at least one value")
+    if len(mu_values) == 0:
+        raise ValueError("mu_array must contain at least one value")
+    if len(rho_values) == 0:
+        raise ValueError("rho_array must contain at least one value")
     if len(likelihood_threshold_values) == 0:
         raise ValueError("likelihood_threshold_array must contain at least one value")
 
     dfs = []
     for weight_by_n in weight_by_n_values:
-        for mismatch in mismatch_values:
-            for likelihood_threshold in likelihood_threshold_values:
-                print(f'Running inference with mm{mismatch} likelihood_threshold{likelihood_threshold} and weight_by_n {weight_by_n}')
-                df = run_1kgp_inference(
-                    subset_num_sites=subset_num_sites,
-                    subset_num_samples=subset_num_samples,
-                    output_path=output_path,
-                    weight_by_n=weight_by_n,
-                    mismatch=mismatch,
-                    recomb_map=recomb_map,
-                    likelihood_threshold=likelihood_threshold,
-                    zarr_path=zarr_path,
-                    region_mask_name=region_mask_name,
-                    store_likelihoods=False,
-                )
-                dfs.append(df)
+        for mu in mu_values:
+            for rho in rho_values:
+                for likelihood_threshold in likelihood_threshold_values:
+                    print(
+                        f"Running inference with mu={mu}, rho={rho}, "
+                        f"likelihood_threshold={likelihood_threshold}, "
+                        f"weight_by_n={weight_by_n}"
+                    )
+                    df = run_1kgp_inference(
+                        subset_num_sites=subset_num_sites,
+                        subset_num_samples=subset_num_samples,
+                        output_path=output_path,
+                        weight_by_n=weight_by_n,
+                        mu=mu,
+                        rho=rho,
+                        likelihood_threshold=likelihood_threshold,
+                        zarr_path=zarr_path,
+                        region_mask_name=region_mask_name,
+                        store_likelihoods=False,
+                    )
+                    dfs.append(df)
 
     if len(dfs) == 0:
         return pd.DataFrame()
 
     return pd.concat(dfs, ignore_index=True)
+
+
+def _run_1kgp_inference_to_disk(task):
+    csv_path = run_1kgp_inference(
+        subset_num_sites=task["subset_num_sites"],
+        subset_num_samples=task["subset_num_samples"],
+        output_path=task["output_path"],
+        weight_by_n=task["weight_by_n"],
+        mu=task["mu"],
+        rho=task["rho"],
+        likelihood_threshold=task["likelihood_threshold"],
+        zarr_path=task["zarr_path"],
+        region_mask_name=task["region_mask_name"],
+        store_likelihoods=True,
+        run_label=task["run_label"],
+        likelihoods_csv_path=task["csv_path"],
+        return_df=False,
+    )
+    return task["task_index"], csv_path
+
+
+def run_1kgp_comparison_in_parallel(subset_num_sites,
+                                    subset_num_samples,
+                                    output_path,
+                                    weight_by_n_array=None,
+                                    mu_array=None,
+                                    rho_array=None,
+                                    likelihood_threshold_array=None,
+                                    zarr_path="/home/duncan/trees/tsinfer-paper/data/chr17/data.zarr/",
+                                    region_mask_name="variant_all_subset_chr17p_region_filterNton23_site_density_threshold_sites_per_kbp_5_window_size_100000_mask",
+                                    store_likelihoods=False,
+                                    max_workers=None,
+                                    ):
+    if weight_by_n_array is None:
+        weight_by_n_array = [True]
+    if mu_array is None:
+        mu_array = [1e-20]
+    if rho_array is None:
+        rho_array = [1e-2]
+    if likelihood_threshold_array is None:
+        likelihood_threshold_array = [1e-13]
+
+    weight_by_n_values = list(weight_by_n_array)
+    mu_values = list(mu_array)
+    rho_values = list(rho_array)
+    likelihood_threshold_values = list(likelihood_threshold_array)
+
+    if len(weight_by_n_values) == 0:
+        raise ValueError("weight_by_n_array must contain at least one value")
+    if len(mu_values) == 0:
+        raise ValueError("mu_array must contain at least one value")
+    if len(rho_values) == 0:
+        raise ValueError("rho_array must contain at least one value")
+    if len(likelihood_threshold_values) == 0:
+        raise ValueError("likelihood_threshold_array must contain at least one value")
+
+    os.makedirs(output_path, exist_ok=True)
+
+    tasks = []
+    combos = itertools.product(
+        weight_by_n_values, mu_values, rho_values, likelihood_threshold_values
+    )
+    for task_index, (weight_by_n, mu, rho, likelihood_threshold) in enumerate(combos):
+        run_label = f"cmp_{task_index:04d}"
+        csv_name = f"comparison_{run_label}_likelihoods.csv"
+        csv_path = os.path.join(output_path, csv_name)
+        tasks.append(
+            {
+                "task_index": task_index,
+                "subset_num_sites": subset_num_sites,
+                "subset_num_samples": subset_num_samples,
+                "output_path": output_path,
+                "weight_by_n": weight_by_n,
+                "mu": mu,
+                "rho": rho,
+                "likelihood_threshold": likelihood_threshold,
+                "zarr_path": zarr_path,
+                "region_mask_name": region_mask_name,
+                "run_label": run_label,
+                "csv_path": csv_path,
+            }
+        )
+
+    if len(tasks) == 0:
+        return pd.DataFrame()
+
+    completed = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_run_1kgp_inference_to_disk, task) for task in tasks]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                completed.append(future.result())
+            except Exception as exc:
+                raise RuntimeError("A parallel 1KGP inference task failed") from exc
+
+    completed.sort(key=lambda x: x[0])
+    csv_paths = [path for _, path in completed]
+    combined_df = pd.concat(
+        (pd.read_csv(path) for path in csv_paths),
+        ignore_index=True,
+    )
+
+    if not store_likelihoods:
+        for path in csv_paths:
+            if os.path.exists(path):
+                os.remove(path)
+
+    return combined_df
 
 
 def make_long_df(df):
@@ -454,6 +631,7 @@ def make_long_df(df):
     """
     df = pd.DataFrame(df, copy=False)
     required = {
+        "path_id",
         "child_id",
         "child_time",
         "site",
@@ -464,6 +642,7 @@ def make_long_df(df):
         "selected_node",
         "selected_mismatch",
         "selected_recombination",
+        "selected_switch_cause",
         "num_min_likelihood",
         "num_max_likelihood",
     }
@@ -505,19 +684,20 @@ def make_long_df(df):
     if k.sum() == 0:
         return pd.DataFrame(
             {
+                "path_id": pd.Series(dtype=np.int32),
                 "child_id": pd.Series(dtype=np.int32),
                 "child_time": pd.Series(dtype=np.float64),
                 "prop_min_likelihood": pd.Series(dtype=np.float64),
                 "prop_max_likelihood": pd.Series(dtype=np.float64),
                 "site": pd.Series(dtype=df["site"].dtype),
                 "k": pd.Series(dtype=np.int64),
-                "full_likelihood": pd.Series(dtype=np.float64),
                 "likelihood_node_id": pd.Series(dtype=np.int32),
-                "likelihood": pd.Series(dtype=np.int8),
+                "likelihood": pd.Series(dtype=np.float64),
                 "recombination_required": pd.Series(dtype=np.int8),
                 "selected_node": pd.Series(dtype=np.int32),
                 "selected_mismatch": pd.Series(dtype=np.int8),
                 "selected_recombination": pd.Series(dtype=np.int8),
+                "selected_switch_cause": pd.Series(dtype=object),
                 "num_min_likelihood": pd.Series(dtype=np.int64),
                 "num_max_likelihood": pd.Series(dtype=np.int64),
             }
@@ -526,15 +706,15 @@ def make_long_df(df):
     likelihood_flat = np.concatenate(likelihoods)
     return pd.DataFrame(
         {
+            "path_id": np.repeat(df["path_id"].to_numpy(dtype=np.int32, copy=False), k),
             "child_id": np.repeat(df["child_id"].to_numpy(dtype=np.int32, copy=False), k),
             "child_time": np.repeat(
                 df["child_time"].to_numpy(dtype=np.float64, copy=False), k
             ),
             "site": np.repeat(df["site"].to_numpy(copy=False), k),
             "k": np.repeat(k, k),
-            "full_likelihood": likelihood_flat,
+            "likelihood": likelihood_flat,
             "likelihood_node_id": np.concatenate(likelihood_nodes),
-            "likelihood": np.equal(likelihood_flat, 1.0).astype(np.int8),
             "recombination_required": np.concatenate(recombination_required),
             "selected_node": np.repeat(
                 df["selected_node"].to_numpy(dtype=np.int32, copy=False), k
@@ -545,6 +725,9 @@ def make_long_df(df):
             "selected_recombination": np.repeat(
                 df["selected_recombination"].to_numpy(dtype=np.int8, copy=False), k
             ),
+            "selected_switch_cause": np.repeat(
+                df["selected_switch_cause"].to_numpy(dtype=object, copy=False), k
+            ),
             "num_min_likelihood": np.repeat(
                 df["num_min_likelihood"].to_numpy(dtype=np.int64, copy=False), k
             ),
@@ -553,3 +736,52 @@ def make_long_df(df):
             ),
         }
     )
+
+def adjust_rho(rho, n):
+    return (rho/n)/(1 - rho + rho/n)
+
+def calculate_upper_k(m, eps, mu, rho, n=1):
+    a = math.log(mu/(1 - mu))
+    b = math.log(adjust_rho(rho, n))
+    e = math.log(eps)
+
+    return math.ceil((e - m*b)/a)
+
+def calculate_upper_m(k, eps, mu, rho, n=1):
+
+    a = math.log(mu/(1 - mu))
+    b = math.log(adjust_rho(rho, n))
+    e = math.log(eps)
+
+    return math.ceil((e - k*a)/b)
+
+def likelihood(k, m, mu, rho, n=1):
+    return (mu / (1 - mu))**k * (adjust_rho(rho, n))**m
+
+def enumerate_possible_likelihoods(eps, mu, rho, n=1):
+    """
+    Given a likelihood threshold eps, recombination prob. rho and mutation prob. mu,
+    calculate the range of all possible combinations of k (num. mismatches) and m
+    (num. switches) relative to a perfect path that result in a likelihood bigger
+    than the threshold. All paths with k or m values outside of this range will
+    have the same likelihood equal to eps. Also, for each combination of k and m,
+    calculate the associated likelihood.
+    """
+    if mu < 0 or mu >= 0.5:
+        raise ValueError("mu must be in the interval [0, 0.5)")
+    if rho < 0 or rho > 1:
+        raise ValueError("rho must be in the interval [0, 1]")
+    if n < 1 or not isinstance(n, int):
+        raise ValueError("n must be an integer >= 1")
+    
+    k_upper = calculate_upper_k(0, eps, mu, rho, n)
+    m_upper = calculate_upper_m(0, eps, mu, rho, n)
+    lik_mat = np.full([k_upper, m_upper], eps)
+    range_pairs = []
+    for k in range(0, k_upper):
+        m_upper = calculate_upper_m(k, eps, mu, rho, n)
+        range_pairs.append(((k, 0), (k, m_upper - 1)))
+        for m in range(0, m_upper):
+            lik_mat[k, m] = likelihood(k, m, mu, rho, n)
+
+    return range_pairs, lik_mat

@@ -1,5 +1,6 @@
 import os
 import sys
+import inspect
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -174,26 +175,30 @@ def plot_path_likelihood(
     cmap="viridis",
     figsize=(14, 8),
     weight_by_n=None,
-    mismatch_ratio=None,
+    mu=None,
+    rho=None,
     compared_by=None,
     long_df=None,
 ):
     """
     Plot per-site likelihood structure for a single path.
 
-    If ``long_df`` is supplied, it is used directly (after filtering) to avoid
-    rebuilding long-form likelihood rows on every redraw.
+    If ``long_df`` is supplied, it is used directly (after filtering). Otherwise
+    likelihood blocks are built directly from compact per-site arrays in ``df``.
     """
-    from likelihoods import make_long_df
 
     def _filter_by_params(frame):
-        frame = frame.copy()
         if weight_by_n is not None and "weight_by_n" in frame.columns:
             frame = frame.loc[frame["weight_by_n"] == weight_by_n]
-        if mismatch_ratio is not None and "mismatch_ratio" in frame.columns:
-            mismatch_values = pd.to_numeric(frame["mismatch_ratio"], errors="coerce")
+        if mu is not None and "mu" in frame.columns:
+            mu_values = pd.to_numeric(frame["mu"], errors="coerce")
             frame = frame.loc[
-                np.isclose(mismatch_values, float(mismatch_ratio), equal_nan=False)
+                np.isclose(mu_values, float(mu), equal_nan=False)
+            ]
+        if rho is not None and "rho" in frame.columns:
+            rho_values = pd.to_numeric(frame["rho"], errors="coerce")
+            frame = frame.loc[
+                np.isclose(rho_values, float(rho), equal_nan=False)
             ]
         if "likelihood_threshold" in frame.columns:
             threshold_values = pd.to_numeric(
@@ -225,28 +230,52 @@ def plot_path_likelihood(
         raise ValueError(f"No sites found for path_id={path_id}")
 
     if long_df is None:
-        long_subset = make_long_df(subset_df)
+        grouped_likelihoods = {}
+        site_payload = (
+            subset_df[["site", "k", "likelihoods", "likelihood_nodes"]]
+            .drop_duplicates(subset=["site"], keep="last")
+            .sort_values("site")
+        )
+        for row in site_payload.itertuples(index=False):
+            k = int(row.k)
+            likelihood_values = np.asarray(row.likelihoods, dtype=np.float64)
+            if len(likelihood_values) != k:
+                raise ValueError(
+                    f"Expected {k} likelihoods at site={row.site}, found {len(likelihood_values)}"
+                )
+            likelihood_node_ids = np.asarray(row.likelihood_nodes, dtype=np.int64)
+            if len(likelihood_node_ids) != k:
+                raise ValueError(
+                    f"Expected {k} likelihood node ids at site={row.site}, found {len(likelihood_node_ids)}"
+                )
+            if k > 1:
+                order = np.lexsort((likelihood_node_ids, likelihood_values))
+                likelihood_values = likelihood_values[order]
+            grouped_likelihoods[row.site] = likelihood_values
     else:
         long_all = pd.DataFrame(long_df, copy=False)
         if "path_id" not in long_all.columns:
             raise ValueError("Provided long_df must contain 'path_id'")
         long_subset = long_all.loc[long_all["path_id"] == path_id]
         long_subset = _filter_by_params(long_subset)
+        long_subset = long_subset.sort_values(
+            ["site", "full_likelihood", "likelihood_node_id"],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        grouped_likelihoods = {
+            site: grp["full_likelihood"].to_numpy(dtype=np.float64, copy=False)
+            for site, grp in long_subset.groupby("site", sort=False)
+        }
 
-    long_subset = long_subset.sort_values(
-        ["site", "full_likelihood", "likelihood_node_id"],
-        kind="mergesort",
-    ).reset_index(drop=True)
-
-    grouped_likelihoods = {
-        site: grp["full_likelihood"].to_numpy(dtype=np.float64, copy=False)
-        for site, grp in long_subset.groupby("site", sort=False)
-    }
-
-    polygons = []
-    values = []
     site_values = site_rows["site"].to_numpy(copy=False)
     k_values = site_rows["k"].to_numpy(dtype=np.int64, copy=False)
+    total_blocks = int(k_values[k_values > 0].sum())
+    if total_blocks == 0:
+        raise ValueError(f"No likelihood values available for path_id={path_id}")
+
+    polygons = np.empty((total_blocks, 4, 2), dtype=np.float32)
+    values = np.empty(total_blocks, dtype=np.float64)
+    offset = 0
 
     for col, (site, k) in enumerate(zip(site_values, k_values)):
         if k <= 0:
@@ -261,22 +290,20 @@ def plot_path_likelihood(
                 f"Expected {k} likelihoods at site={site}, found {len(site_likelihoods)}"
             )
 
-        y_edges = np.linspace(0.0, 1.0, k + 1)
-        for row, value in enumerate(site_likelihoods):
-            polygons.append(
-                [
-                    (col, y_edges[row]),
-                    (col + 1, y_edges[row]),
-                    (col + 1, y_edges[row + 1]),
-                    (col, y_edges[row + 1]),
-                ]
-            )
-            values.append(value)
+        y_edges = np.linspace(0.0, 1.0, k + 1, dtype=np.float32)
+        next_offset = offset + k
+        block = polygons[offset:next_offset]
+        block[:, 0, 0] = col
+        block[:, 0, 1] = y_edges[:-1]
+        block[:, 1, 0] = col + 1
+        block[:, 1, 1] = y_edges[:-1]
+        block[:, 2, 0] = col + 1
+        block[:, 2, 1] = y_edges[1:]
+        block[:, 3, 0] = col
+        block[:, 3, 1] = y_edges[1:]
+        values[offset:next_offset] = site_likelihoods
+        offset = next_offset
 
-    if len(values) == 0:
-        raise ValueError(f"No likelihood values available for path_id={path_id}")
-
-    values = np.asarray(values, dtype=np.float64)
     if not np.all(np.isfinite(values)):
         raise ValueError("Likelihood values must be finite")
 
@@ -336,11 +363,13 @@ def plot_path_likelihood(
             return rf"$\bf{{{math_label}}}$"
         return label
 
-    title_parts = [f"Path {path_id} (child_id={child_label})"]
+    title_parts = [f"Path {path_id}"]
     if "weight_by_n" in subset_df.columns:
         title_parts.append(_format_param("weight_by_n", bool(subset_df["weight_by_n"].iloc[0])))
-    if "mismatch_ratio" in subset_df.columns:
-        title_parts.append(_format_param("mismatch_ratio", float(subset_df["mismatch_ratio"].iloc[0])))
+    if "mu" in subset_df.columns:
+        title_parts.append(_format_param("mu", float(subset_df["mu"].iloc[0])))
+    if "rho" in subset_df.columns:
+        title_parts.append(_format_param("rho", float(subset_df["rho"].iloc[0])))
     if "likelihood_threshold" in subset_df.columns:
         title_parts.append(_format_param("likelihood_threshold", float(subset_df["likelihood_threshold"].iloc[0])))
     ax_heat.set_title(" | ".join(title_parts))
@@ -363,7 +392,7 @@ def plot_path_likelihood(
     for site in recombination_sites:
         x = site_to_x.get(site)
         if x is not None:
-            ax_heat.axvline(x, color="#ff69b4", linewidth=1.2, alpha=0.95)
+            ax_heat.axvline(x, color="orange", linewidth=1.2, alpha=0.95)
 
     ax_k.bar(
         np.arange(len(site_rows)),
@@ -375,7 +404,6 @@ def plot_path_likelihood(
     )
     ax_k.set_ylabel("Num. tracked nodes")
     ax_k.set_xlabel("Site")
-    ax_k.set_yscale("log")
     positive_k = k_values[k_values > 0]
     if len(positive_k) > 0:
         ax_k.set_ylim(bottom=max(0.8, float(np.min(positive_k)) * 0.8))
@@ -417,8 +445,19 @@ def plot_path_likelihood(
     high_cbar = fig.colorbar(high_sm, cax=main_cax)
 
     threshold_label = np.format_float_scientific(likelihood_threshold, precision=0)
-    high_cbar.set_ticks([legend_min, high_vmax])
-    high_cbar.set_ticklabels([f"{threshold_label}\n+ ε", f"{high_vmax:.2g}"])
+    mid_ticks = np.array([0.2, 0.4, 0.6, 0.8], dtype=np.float64)
+    valid_mid_ticks = mid_ticks[
+        np.logical_and(mid_ticks > legend_min, mid_ticks < high_vmax)
+    ]
+    tick_values = np.concatenate(
+        [np.array([legend_min], dtype=np.float64), valid_mid_ticks, np.array([high_vmax])]
+    )
+    high_cbar.set_ticks(tick_values.tolist())
+    high_cbar.set_ticklabels(
+        [f"{threshold_label} + ε"]
+        + [f"{tick:.1f}" for tick in valid_mid_ticks]
+        + [f"{high_vmax:.2g}"]
+    )
 
     threshold_ax = fig.add_axes([legend_x, threshold_y, legend_width, threshold_height])
     threshold_ax.add_patch(
@@ -444,7 +483,7 @@ def plot_path_likelihood(
         Line2D(
             [0],
             [0],
-            color="#ff69b4",
+            color="orange",
             lw=1.8,
             label=f"recombination (n={num_recombinations})",
         ),
@@ -462,6 +501,7 @@ def plot_path_likelihood(
     )
 
     plt.show()
+    plt.close(fig)
 
 
 def plot_paths_interactively(df):
@@ -472,6 +512,9 @@ def plot_paths_interactively(df):
     - Slider is global path_id (0..max path_id) and does not change with params.
     - Parameter selectors fix non-compared parameters.
     - Compare-by selector plots one column per value of selected compare variable.
+
+    To reduce memory use on large data, plotting reads compact per-site likelihood
+    arrays directly instead of building cached long-form tables by default.
     """
     try:
         import ipywidgets as widgets
@@ -481,13 +524,14 @@ def plot_paths_interactively(df):
             "plot_paths_interactively requires ipywidgets and IPython display"
         ) from exc
 
-    from likelihoods import make_long_df, summarise_paths
+    from likelihoods import summarise_paths
 
     combined_df = pd.DataFrame(df, copy=False)
     required = {
         "path_id",
         "weight_by_n",
-        "mismatch_ratio",
+        "mu",
+        "rho",
         "likelihood_threshold",
         "k",
     }
@@ -503,16 +547,6 @@ def plot_paths_interactively(df):
         ["num_errors", "path_id"], kind="mergesort"
     ).reset_index(drop=True)
 
-    # Build long dataframe once for all updates.
-    long_base = make_long_df(combined_df)
-    repeats = combined_df["k"].to_numpy(dtype=np.int64, copy=False)
-    long_base["path_id"] = np.repeat(
-        combined_df["path_id"].to_numpy(copy=False), repeats
-    )
-    for col in ["weight_by_n", "mismatch_ratio", "likelihood_threshold"]:
-        if col in combined_df.columns:
-            long_base[col] = np.repeat(combined_df[col].to_numpy(copy=False), repeats)
-
     def _fmt_value(v):
         if isinstance(v, (float, np.floating)):
             return np.format_float_scientific(float(v), precision=2)
@@ -522,7 +556,8 @@ def plot_paths_interactively(df):
     ordered_weights = [v for v in [True, False] if v in set(weight_values)]
     ordered_weights.extend([v for v in weight_values if v not in set(ordered_weights)])
 
-    mismatch_values = sorted(float(v) for v in pd.unique(combined_df["mismatch_ratio"]))
+    mu_values = sorted(float(v) for v in pd.unique(combined_df["mu"]))
+    rho_values = sorted(float(v) for v in pd.unique(combined_df["rho"]))
     threshold_values = sorted(
         float(v) for v in pd.unique(combined_df["likelihood_threshold"])
     )
@@ -531,9 +566,13 @@ def plot_paths_interactively(df):
         options=[(str(v), v) for v in ordered_weights],
         description="weight_by_n",
     )
-    mismatch_buttons = widgets.ToggleButtons(
-        options=[(_fmt_value(v), v) for v in mismatch_values],
-        description="mismatch_ratio",
+    mu_buttons = widgets.ToggleButtons(
+        options=[(_fmt_value(v), v) for v in mu_values],
+        description="mu",
+    )
+    rho_buttons = widgets.ToggleButtons(
+        options=[(_fmt_value(v), v) for v in rho_values],
+        description="rho",
     )
     threshold_buttons = widgets.ToggleButtons(
         options=[(_fmt_value(v), v) for v in threshold_values],
@@ -542,7 +581,8 @@ def plot_paths_interactively(df):
     compare_buttons = widgets.ToggleButtons(
         options=[
             ("weight_by_n", "weight_by_n"),
-            ("mismatch_ratio", "mismatch_ratio"),
+            ("mu", "mu"),
+            ("rho", "rho"),
             ("likelihood_threshold", "likelihood_threshold"),
         ],
         description="Compare by",
@@ -554,27 +594,38 @@ def plot_paths_interactively(df):
         min=0,
         max=max_path_id,
         step=1,
-        description="path_id",
+        description="path",
         continuous_update=False,
         readout=True,
-        layout=widgets.Layout(width="95%"),
+        layout=widgets.Layout(width="82%"),
+    )
+    path_input = widgets.BoundedIntText(
+        value=0,
+        min=0,
+        max=max_path_id,
+        step=1,
+        description="path_id",
+        layout=widgets.Layout(width="18%"),
     )
 
     status = widgets.HTML()
     output = widgets.Output()
 
+    path_row = widgets.HBox([slider, path_input], layout=widgets.Layout(width="100%"))
     controls_row = widgets.HBox(
-        [weight_buttons, mismatch_buttons, threshold_buttons],
+        [weight_buttons, mu_buttons, rho_buttons, threshold_buttons],
         layout=widgets.Layout(width="100%"),
     )
     compare_row = widgets.HBox([compare_buttons], layout=widgets.Layout(width="100%"))
-    ui = widgets.VBox([output, slider, controls_row, compare_row, status])
+    ui = widgets.VBox([output, path_row, controls_row, compare_row, status])
 
     def _get_compare_values(name):
         if name == "weight_by_n":
             return ordered_weights
-        if name == "mismatch_ratio":
-            return mismatch_values
+        if name == "mu":
+            return mu_values
+        if name == "rho":
+            return rho_values
         if name == "likelihood_threshold":
             return threshold_values
         raise ValueError(f"Unknown compare variable: {name}")
@@ -582,7 +633,8 @@ def plot_paths_interactively(df):
     def _parameter_set(compare_name, compare_value):
         params = {
             "weight_by_n": weight_buttons.value,
-            "mismatch_ratio": float(mismatch_buttons.value),
+            "mu": float(mu_buttons.value),
+            "rho": float(rho_buttons.value),
             "likelihood_threshold": float(threshold_buttons.value),
         }
         params[compare_name] = compare_value
@@ -593,8 +645,15 @@ def plot_paths_interactively(df):
         subset = subset.loc[subset["weight_by_n"] == params["weight_by_n"]]
         subset = subset.loc[
             np.isclose(
-                pd.to_numeric(subset["mismatch_ratio"], errors="coerce"),
-                float(params["mismatch_ratio"]),
+                pd.to_numeric(subset["mu"], errors="coerce"),
+                float(params["mu"]),
+                equal_nan=False,
+            )
+        ]
+        subset = subset.loc[
+            np.isclose(
+                pd.to_numeric(subset["rho"], errors="coerce"),
+                float(params["rho"]),
                 equal_nan=False,
             )
         ]
@@ -613,14 +672,23 @@ def plot_paths_interactively(df):
         path_id = int(slider.value)
         compare_name = compare_buttons.value
         compare_values = _get_compare_values(compare_name)
+        n_cols = max(1, len(compare_values))
+
+        # Shrink per-panel plot width as the number of compared columns increases.
+        panel_fig_width = max(4.2, 13.0 / n_cols)
+        panel_fig_height = max(4.8, 8.0 - 0.6 * (n_cols - 1))
+        panel_figsize = (panel_fig_width, panel_fig_height)
 
         panel_outputs = []
         status_parts = []
+        panel_width = max(20, int(98 / n_cols))
 
         for value in compare_values:
             params = _parameter_set(compare_name, value)
             label = f"{compare_name}={_fmt_value(value)}"
-            panel = widgets.Output(layout=widgets.Layout(width=f"{max(30, int(98 / max(1, len(compare_values))))}%"))
+            panel = widgets.Output(
+                layout=widgets.Layout(width=f"{panel_width}%")
+            )
 
             with panel:
                 row = _find_summary_row(path_id, params)
@@ -637,9 +705,10 @@ def plot_paths_interactively(df):
                         path_id=path_id,
                         likelihood_threshold=float(params["likelihood_threshold"]),
                         weight_by_n=bool(params["weight_by_n"]),
-                        mismatch_ratio=float(params["mismatch_ratio"]),
+                        mu=float(params["mu"]),
+                        rho=float(params["rho"]),
                         compared_by=compare_name,
-                        long_df=long_base,
+                        figsize=panel_figsize,
                     )
             panel_outputs.append(panel)
 
@@ -659,9 +728,28 @@ def plot_paths_interactively(df):
         if change.get("name") == "value":
             draw_current()
 
-    slider.observe(_on_change, names="value")
+    def _on_slider_change(change):
+        if change.get("name") != "value":
+            return
+        new_path = int(change["new"])
+        if int(path_input.value) != new_path:
+            path_input.value = new_path
+        draw_current()
+
+    def _on_path_input_change(change):
+        if change.get("name") != "value":
+            return
+        new_path = int(change["new"])
+        if int(slider.value) != new_path:
+            slider.value = new_path
+        else:
+            draw_current()
+
+    slider.observe(_on_slider_change, names="value")
+    path_input.observe(_on_path_input_change, names="value")
     weight_buttons.observe(_on_change, names="value")
-    mismatch_buttons.observe(_on_change, names="value")
+    mu_buttons.observe(_on_change, names="value")
+    rho_buttons.observe(_on_change, names="value")
     threshold_buttons.observe(_on_change, names="value")
     compare_buttons.observe(_on_change, names="value")
 
@@ -671,11 +759,433 @@ def plot_paths_interactively(df):
     return {
         "ui": ui,
         "path_df": path_df,
-        "long_df": long_base,
         "slider": slider,
+        "path_input": path_input,
         "weight_buttons": weight_buttons,
-        "mismatch_buttons": mismatch_buttons,
+        "mu_buttons": mu_buttons,
+        "rho_buttons": rho_buttons,
         "threshold_buttons": threshold_buttons,
         "compare_buttons": compare_buttons,
     }
 
+
+def plot_grouped_barchart(
+    ax, path_df, variable, fixed="likelihood_threshold", group_by=None
+):
+    """
+    Plot grouped boxplots of ``variable`` for one fixed parameter setting.
+
+    The fixed parameter is held at its first observed value.
+    Grouping uses ``group_by`` on the x-axis, and the other unfixed parameter
+    is used as color hue.
+    """
+    df = pd.DataFrame(path_df, copy=False)
+    parameter_order = ["weight_by_n", "mu", "rho", "likelihood_threshold"]
+
+    if variable not in df.columns:
+        raise ValueError(f"Column '{variable}' not found in path_df")
+    if fixed not in parameter_order:
+        raise ValueError(
+            f"'fixed' must be one of {parameter_order}, got '{fixed}'"
+        )
+    if fixed not in df.columns:
+        raise ValueError(f"Column '{fixed}' not found in path_df")
+
+    unfixed = [col for col in parameter_order if col != fixed and col in df.columns]
+    if len(unfixed) < 2:
+        raise ValueError(
+            "Need at least two unfixed parameter columns in path_df; "
+            f"found {unfixed}"
+        )
+    if group_by is None:
+        x_col = unfixed[0]
+    else:
+        if group_by not in parameter_order:
+            raise ValueError(
+                f"'group_by' must be one of {parameter_order}, got '{group_by}'"
+            )
+        if group_by == fixed:
+            raise ValueError(
+                f"'group_by' cannot equal fixed ('{fixed}')"
+            )
+        if group_by not in unfixed:
+            raise ValueError(
+                f"Column '{group_by}' not available for grouping in path_df"
+            )
+        x_col = group_by
+    remaining = [col for col in unfixed if col != x_col]
+    hue_col = remaining[0]
+    extra_fixed_cols = remaining[1:]
+
+    fixed_candidates = df[fixed].dropna().to_numpy(copy=False)
+    if len(fixed_candidates) == 0:
+        raise ValueError(f"No non-null values found in fixed column '{fixed}'")
+    fixed_value = fixed_candidates[0]
+    subset = df.loc[df[fixed] == fixed_value].copy()
+    if len(subset) == 0:
+        raise ValueError(
+            f"No rows available after filtering {fixed}={fixed_value!r}"
+        )
+    extra_fixed_values = {}
+    for col in extra_fixed_cols:
+        col_candidates = subset[col].dropna().to_numpy(copy=False)
+        if len(col_candidates) == 0:
+            continue
+        col_value = col_candidates[0]
+        subset = subset.loc[subset[col] == col_value]
+        extra_fixed_values[col] = col_value
+
+    def _sorted_values(values, col):
+        unique_vals = list(pd.unique(values))
+        if col == "weight_by_n":
+            ordered = [v for v in [True, False] if v in set(unique_vals)]
+            ordered.extend([v for v in unique_vals if v not in set(ordered)])
+            return ordered
+        numeric_vals = pd.to_numeric(pd.Series(unique_vals), errors="coerce")
+        if numeric_vals.notna().all():
+            return sorted(float(v) for v in unique_vals)
+        return sorted(unique_vals, key=lambda x: str(x))
+
+    x_order = _sorted_values(subset[x_col], x_col)
+    hue_order = _sorted_values(subset[hue_col], hue_col)
+
+    boxplot_kwargs = dict(
+        data=subset,
+        x=x_col,
+        y=variable,
+        hue=hue_col,
+        order=x_order,
+        hue_order=hue_order,
+        ax=ax,
+        palette="tab10",
+        width=0.65,
+        dodge=True,
+        showfliers=True,
+    )
+    if "gap" in inspect.signature(sns.boxplot).parameters:
+        boxplot_kwargs["gap"] = 0.12
+
+    sns.boxplot(**boxplot_kwargs)
+    ax.set_title(variable)
+    ax.set_xlabel(x_col)
+    ax.set_ylabel(variable)
+    ax.legend(
+        title=hue_col,
+        frameon=False,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        borderaxespad=0.0,
+    )
+    return {
+        "fixed": fixed,
+        "fixed_value": fixed_value,
+        "x": x_col,
+        "hue": hue_col,
+        "extra_fixed": extra_fixed_values,
+    }
+
+
+def plot_grouped_hist_by_site(
+    df, variable, group_by, fixed, bins=15, y_log=True
+):
+    """
+    Plot binned site histograms of ``variable`` over a parameter grid.
+
+    - ``fixed`` parameter is held at its first observed value.
+    - ``group_by`` parameter defines subplot columns.
+    - The remaining unfixed parameter defines subplot rows.
+    """
+    frame = pd.DataFrame(df, copy=False)
+    parameter_order = ["weight_by_n", "mu", "rho", "likelihood_threshold"]
+
+    if variable not in frame.columns:
+        raise ValueError(f"Column '{variable}' not found in df")
+    if "site" not in frame.columns:
+        raise ValueError("Column 'site' not found in df")
+    if fixed not in parameter_order:
+        raise ValueError(f"'fixed' must be one of {parameter_order}, got '{fixed}'")
+    if group_by not in parameter_order:
+        raise ValueError(
+            f"'group_by' must be one of {parameter_order}, got '{group_by}'"
+        )
+    if fixed == group_by:
+        raise ValueError("'fixed' and 'group_by' must be different")
+    if fixed not in frame.columns:
+        raise ValueError(f"Column '{fixed}' not found in df")
+    if group_by not in frame.columns:
+        raise ValueError(f"Column '{group_by}' not found in df")
+
+    row_candidates = [
+        col for col in parameter_order if col not in {fixed, group_by} and col in frame.columns
+    ]
+    if len(row_candidates) == 0:
+        raise ValueError(
+            "Could not determine row parameter from remaining unfixed columns; "
+            f"found {row_candidates}"
+        )
+    row_by = row_candidates[0]
+    extra_fixed_cols = row_candidates[1:]
+
+    fixed_candidates = frame[fixed].dropna().to_numpy(copy=False)
+    if len(fixed_candidates) == 0:
+        raise ValueError(f"No non-null values found in fixed column '{fixed}'")
+    fixed_value = fixed_candidates[0]
+    subset = frame.loc[frame[fixed] == fixed_value].copy()
+    if len(subset) == 0:
+        raise ValueError(f"No rows available after filtering {fixed}={fixed_value!r}")
+    extra_fixed_values = {}
+    for col in extra_fixed_cols:
+        col_candidates = subset[col].dropna().to_numpy(copy=False)
+        if len(col_candidates) == 0:
+            continue
+        col_value = col_candidates[0]
+        subset = subset.loc[subset[col] == col_value]
+        extra_fixed_values[col] = col_value
+
+    if int(bins) <= 0:
+        raise ValueError("'bins' must be a positive integer")
+    bins = int(bins)
+
+    variable_values = pd.to_numeric(subset[variable], errors="coerce")
+    if variable_values.isna().all():
+        raise ValueError(f"Column '{variable}' has no numeric values after filtering")
+    subset = subset.loc[variable_values.notna()].copy()
+    subset[variable] = variable_values.loc[subset.index].to_numpy(dtype=np.float64)
+    subset["site"] = pd.to_numeric(subset["site"], errors="coerce")
+    subset = subset.loc[subset["site"].notna()].copy()
+    if len(subset) == 0:
+        raise ValueError("No finite numeric site values after filtering")
+
+    def _sorted_values(values, col):
+        unique_vals = list(pd.unique(values))
+        if col == "weight_by_n":
+            ordered = [v for v in [True, False] if v in set(unique_vals)]
+            ordered.extend([v for v in unique_vals if v not in set(ordered)])
+            return ordered
+        numeric_vals = pd.to_numeric(pd.Series(unique_vals), errors="coerce")
+        if numeric_vals.notna().all():
+            return sorted(float(v) for v in unique_vals)
+        return sorted(unique_vals, key=lambda x: str(x))
+
+    col_values = _sorted_values(subset[group_by], group_by)
+    row_values = _sorted_values(subset[row_by], row_by)
+    if len(col_values) == 0 or len(row_values) == 0:
+        raise ValueError("No values available to plot after filtering")
+
+    site_values = subset["site"].to_numpy(dtype=np.float64, copy=False)
+    site_min = float(np.min(site_values))
+    site_max = float(np.max(site_values))
+    if not np.isfinite(site_min) or not np.isfinite(site_max):
+        raise ValueError("Site values must be finite")
+    if site_min == site_max:
+        site_max = site_min + 1.0
+    bin_edges = np.linspace(site_min, site_max, bins + 1, dtype=np.float64)
+
+    n_rows = len(row_values)
+    n_cols = len(col_values)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+        figsize=(max(4.0 * n_cols, 8.0), max(2.8 * n_rows, 4.0)),
+    )
+
+    palette = sns.color_palette("tab10", n_colors=n_cols)
+    col_colors = {value: palette[i] for i, value in enumerate(col_values)}
+
+    for row_idx, row_value in enumerate(row_values):
+        for col_idx, col_value in enumerate(col_values):
+            ax = axes[row_idx, col_idx]
+            panel_df = subset.loc[
+                (subset[row_by] == row_value) & (subset[group_by] == col_value)
+            ]
+            if len(panel_df) == 0:
+                ax.set_axis_off()
+                continue
+
+            panel_sites = panel_df["site"].to_numpy(dtype=np.float64, copy=False)
+            panel_weights = panel_df[variable].to_numpy(dtype=np.float64, copy=False)
+            valid = np.isfinite(panel_sites) & np.isfinite(panel_weights)
+            if not np.any(valid):
+                ax.set_axis_off()
+                continue
+
+            counts, _ = np.histogram(
+                panel_sites[valid], bins=bin_edges, weights=panel_weights[valid]
+            )
+            ax.bar(
+                bin_edges[:-1],
+                counts,
+                width=np.diff(bin_edges),
+                align="edge",
+                color=col_colors[col_value],
+                edgecolor="none",
+                alpha=0.95,
+            )
+            if y_log:
+                ax.set_yscale("log")
+                positive_counts = counts[counts > 0]
+                if len(positive_counts) > 0:
+                    ax.set_ylim(bottom=max(0.8, float(np.min(positive_counts)) * 0.8))
+
+            if row_idx == 0:
+                ax.set_title(f"{group_by}={col_value}")
+            if col_idx == 0:
+                ax.set_ylabel(f"{variable}\n{row_by}={row_value}")
+            if row_idx == n_rows - 1:
+                ax.set_xlabel("site")
+
+    fig.suptitle(f"{variable} by site ({fixed}={fixed_value})", y=1.02)
+    fig.tight_layout()
+    return {
+        "fig": fig,
+        "axes": axes,
+        "fixed": fixed,
+        "fixed_value": fixed_value,
+        "group_by": group_by,
+        "row_by": row_by,
+        "extra_fixed": extra_fixed_values,
+    }
+
+
+def plot_hist_by_path(path_df, variable, group_by, fixed, bins=15, y_log=True):
+    """
+    Plot histograms of a path-level variable over a parameter grid.
+
+    - ``fixed`` parameter is held at its first observed value.
+    - ``group_by`` parameter defines subplot columns.
+    - The remaining unfixed parameter defines subplot rows.
+    """
+    frame = pd.DataFrame(path_df, copy=False)
+    parameter_order = ["weight_by_n", "mu", "rho", "likelihood_threshold"]
+
+    if variable not in frame.columns:
+        raise ValueError(f"Column '{variable}' not found in path_df")
+    if fixed not in parameter_order:
+        raise ValueError(f"'fixed' must be one of {parameter_order}, got '{fixed}'")
+    if group_by not in parameter_order:
+        raise ValueError(
+            f"'group_by' must be one of {parameter_order}, got '{group_by}'"
+        )
+    if fixed == group_by:
+        raise ValueError("'fixed' and 'group_by' must be different")
+    if fixed not in frame.columns:
+        raise ValueError(f"Column '{fixed}' not found in path_df")
+    if group_by not in frame.columns:
+        raise ValueError(f"Column '{group_by}' not found in path_df")
+    if int(bins) <= 0:
+        raise ValueError("'bins' must be a positive integer")
+    bins = int(bins)
+
+    row_candidates = [
+        col
+        for col in parameter_order
+        if col not in {fixed, group_by} and col in frame.columns
+    ]
+    if len(row_candidates) == 0:
+        raise ValueError(
+            "Could not determine row parameter from remaining unfixed columns; "
+            f"found {row_candidates}"
+        )
+    row_by = row_candidates[0]
+    extra_fixed_cols = row_candidates[1:]
+
+    fixed_candidates = frame[fixed].dropna().to_numpy(copy=False)
+    if len(fixed_candidates) == 0:
+        raise ValueError(f"No non-null values found in fixed column '{fixed}'")
+    fixed_value = fixed_candidates[0]
+    subset = frame.loc[frame[fixed] == fixed_value].copy()
+    if len(subset) == 0:
+        raise ValueError(f"No rows available after filtering {fixed}={fixed_value!r}")
+    extra_fixed_values = {}
+    for col in extra_fixed_cols:
+        col_candidates = subset[col].dropna().to_numpy(copy=False)
+        if len(col_candidates) == 0:
+            continue
+        col_value = col_candidates[0]
+        subset = subset.loc[subset[col] == col_value]
+        extra_fixed_values[col] = col_value
+
+    variable_values = pd.to_numeric(subset[variable], errors="coerce")
+    if variable_values.isna().all():
+        raise ValueError(f"Column '{variable}' has no numeric values after filtering")
+    subset = subset.loc[variable_values.notna()].copy()
+    subset[variable] = variable_values.loc[subset.index].to_numpy(dtype=np.float64)
+
+    def _sorted_values(values, col):
+        unique_vals = list(pd.unique(values))
+        if col == "weight_by_n":
+            ordered = [v for v in [True, False] if v in set(unique_vals)]
+            ordered.extend([v for v in unique_vals if v not in set(ordered)])
+            return ordered
+        numeric_vals = pd.to_numeric(pd.Series(unique_vals), errors="coerce")
+        if numeric_vals.notna().all():
+            return sorted(float(v) for v in unique_vals)
+        return sorted(unique_vals, key=lambda x: str(x))
+
+    col_values = _sorted_values(subset[group_by], group_by)
+    row_values = _sorted_values(subset[row_by], row_by)
+    if len(col_values) == 0 or len(row_values) == 0:
+        raise ValueError("No values available to plot after filtering")
+
+    n_rows = len(row_values)
+    n_cols = len(col_values)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+        figsize=(max(4.0 * n_cols, 8.0), max(2.8 * n_rows, 4.0)),
+    )
+
+    palette = sns.color_palette("tab10", n_colors=n_cols)
+    col_colors = {value: palette[i] for i, value in enumerate(col_values)}
+
+    for row_idx, row_value in enumerate(row_values):
+        for col_idx, col_value in enumerate(col_values):
+            ax = axes[row_idx, col_idx]
+            panel_df = subset.loc[
+                (subset[row_by] == row_value) & (subset[group_by] == col_value)
+            ]
+            if len(panel_df) == 0:
+                ax.set_axis_off()
+                continue
+
+            values = panel_df[variable].to_numpy(dtype=np.float64, copy=False)
+            values = values[np.isfinite(values)]
+            if len(values) == 0:
+                ax.set_axis_off()
+                continue
+
+            ax.hist(
+                values,
+                bins=bins,
+                color=col_colors[col_value],
+                edgecolor="white",
+                linewidth=0.4,
+                alpha=0.95,
+            )
+            if y_log:
+                ax.set_yscale("log")
+
+            if row_idx == 0:
+                ax.set_title(f"{group_by}={col_value}")
+            if col_idx == 0:
+                ax.set_ylabel(f"count\n{row_by}={row_value}")
+            if row_idx == n_rows - 1:
+                ax.set_xlabel(variable)
+
+    fig.suptitle(f"{variable} by path ({fixed}={fixed_value})", y=1.02)
+    fig.tight_layout()
+    return {
+        "fig": fig,
+        "axes": axes,
+        "fixed": fixed,
+        "fixed_value": fixed_value,
+        "group_by": group_by,
+        "row_by": row_by,
+        "extra_fixed": extra_fixed_values,
+    }
