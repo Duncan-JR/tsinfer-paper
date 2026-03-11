@@ -16,15 +16,6 @@ import struct
 import msprime
 import math
 
-
-SWITCH_CAUSE_NAMES = {
-    0: "none",
-    1: "forced_end",
-    2: "score_driven",
-    3: "ambiguous",
-}
-
-
 def load_hmm_log(path, likelihood_threshold=1e-13):
     with open(path, "rb") as f:
         data = f.read()
@@ -34,8 +25,8 @@ def load_hmm_log(path, likelihood_threshold=1e-13):
     if data[:8] != b"TSILHMML":
         raise ValueError(f"Bad magic: {data[:8]!r}")
     version = struct.unpack_from("<I", data, 8)[0]
-    if version != 7:
-        raise ValueError(f"Unsupported version: {version}. Expected version 7.")
+    if version != 6:
+        raise ValueError(f"Unsupported version: {version}. Expected version 6.")
 
     view = memoryview(data)
     path_begin_child_id = {}
@@ -95,20 +86,14 @@ def load_hmm_log(path, likelihood_threshold=1e-13):
                 _, _, _ = struct.unpack_from("<QiQ", data, pos)
                 pos += 20
             elif rec_type == 4:  # SELECTED_NODE
-                (
-                    path_id,
-                    site,
-                    selected_node,
-                    selected_mismatch,
-                    selected_recombination,
-                    selected_switch_cause,
-                ) = struct.unpack_from("<Qiibbb", data, pos)
-                pos += 19
+                path_id, site, selected_node, selected_mismatch, selected_recombination = (
+                    struct.unpack_from("<Qiibb", data, pos)
+                )
+                pos += 18
                 selected_map[(path_id, site)] = (
                     selected_node,
                     selected_mismatch,
                     selected_recombination,
-                    selected_switch_cause,
                 )
             else:
                 raise ValueError(f"Unknown record type: {rec_type}")
@@ -131,7 +116,6 @@ def load_hmm_log(path, likelihood_threshold=1e-13):
                 "selected_node": pd.Series(dtype=np.int32),
                 "selected_mismatch": pd.Series(dtype=np.int8),
                 "selected_recombination": pd.Series(dtype=np.int8),
-                "selected_switch_cause": pd.Series(dtype=object),
                 "child_id": pd.Series(dtype=np.int32),
                 "child_time": pd.Series(dtype=np.float64),
                 "prop_min_likelihood": pd.Series(dtype=np.float64),
@@ -142,23 +126,12 @@ def load_hmm_log(path, likelihood_threshold=1e-13):
         selected_node = np.full(n_sites, -1, dtype=np.int32)
         selected_mismatch = np.full(n_sites, -1, dtype=np.int8)
         selected_recombination = np.full(n_sites, -1, dtype=np.int8)
-        selected_switch_cause_code = np.zeros(n_sites, dtype=np.uint8)
         for index, (path_id, site) in enumerate(zip(site_path_ids, site_sites)):
             values = selected_map.get((path_id, site))
             if values is not None:
                 selected_node[index] = values[0]
                 selected_mismatch[index] = values[1]
                 selected_recombination[index] = values[2]
-                selected_switch_cause_code[index] = values[3]
-
-        selected_switch_cause = np.fromiter(
-            (
-                SWITCH_CAUSE_NAMES.get(int(code), f"unknown_{int(code)}")
-                for code in selected_switch_cause_code
-            ),
-            dtype=object,
-            count=n_sites,
-        )
 
         child_id = np.fromiter(
             (path_begin_child_id.get(path_id, -1) for path_id in site_path_ids),
@@ -182,7 +155,6 @@ def load_hmm_log(path, likelihood_threshold=1e-13):
                 "selected_node": selected_node,
                 "selected_mismatch": selected_mismatch,
                 "selected_recombination": selected_recombination,
-                "selected_switch_cause": selected_switch_cause,
                 "child_id": child_id,
                 "child_time": child_time,
                 "prop_min_likelihood": np.asarray(
@@ -212,7 +184,6 @@ def summarise_paths(df):
         "path_id",
         "child_id",
         "selected_recombination",
-        "selected_switch_cause",
         "selected_mismatch",
         "num_max_likelihood",
         "num_min_likelihood",
@@ -237,9 +208,6 @@ def summarise_paths(df):
             "path_id": pd.Series(dtype=np.uint64),
             "child_id": pd.Series(dtype=np.int32),
             "num_switches": pd.Series(dtype=np.int64),
-            "num_switches_forced_end": pd.Series(dtype=np.int64),
-            "num_switches_score_driven": pd.Series(dtype=np.int64),
-            "num_switches_ambiguous": pd.Series(dtype=np.int64),
             "num_mismatches": pd.Series(dtype=np.int64),
             "num_errors": pd.Series(dtype=np.int64),
             "prop_tie_breaks": pd.Series(dtype=np.float64),
@@ -257,9 +225,6 @@ def summarise_paths(df):
             *parameter_columns,
             "child_id",
             "num_switches",
-            "num_switches_forced_end",
-            "num_switches_score_driven",
-            "num_switches_ambiguous",
             "num_mismatches",
             "num_errors",
             "prop_tie_breaks",
@@ -297,10 +262,6 @@ def summarise_paths(df):
         df["num_max_likelihood"].to_numpy(dtype=np.int64, copy=False) > 1,
         index=df.index,
     )
-    switch_cause = pd.Series(
-        df["selected_switch_cause"].to_numpy(dtype=object, copy=False),
-        index=df.index,
-    )
 
     group_keys = [df[col] for col in group_columns]
 
@@ -316,24 +277,6 @@ def summarise_paths(df):
     summary["num_switches"] = (
         switch_flag.groupby(group_keys, sort=False).sum().astype(np.int64)
     )
-    summary["num_switches_forced_end"] = (
-        ((switch_cause == "forced_end") & switch_flag)
-        .groupby(group_keys, sort=False)
-        .sum()
-        .astype(np.int64)
-    )
-    summary["num_switches_score_driven"] = (
-        ((switch_cause == "score_driven") & switch_flag)
-        .groupby(group_keys, sort=False)
-        .sum()
-        .astype(np.int64)
-    )
-    summary["num_switches_ambiguous"] = (
-        ((switch_cause == "ambiguous") & switch_flag)
-        .groupby(group_keys, sort=False)
-        .sum()
-        .astype(np.int64)
-    )
     summary["num_mismatches"] = (
         mismatch_flag.groupby(group_keys, sort=False).sum().astype(np.int64)
     )
@@ -346,9 +289,6 @@ def summarise_paths(df):
         *parameter_columns,
         "child_id",
         "num_switches",
-        "num_switches_forced_end",
-        "num_switches_score_driven",
-        "num_switches_ambiguous",
         "num_mismatches",
         "num_errors",
         "prop_tie_breaks",
@@ -642,7 +582,6 @@ def make_long_df(df):
         "selected_node",
         "selected_mismatch",
         "selected_recombination",
-        "selected_switch_cause",
         "num_min_likelihood",
         "num_max_likelihood",
     }
@@ -697,7 +636,6 @@ def make_long_df(df):
                 "selected_node": pd.Series(dtype=np.int32),
                 "selected_mismatch": pd.Series(dtype=np.int8),
                 "selected_recombination": pd.Series(dtype=np.int8),
-                "selected_switch_cause": pd.Series(dtype=object),
                 "num_min_likelihood": pd.Series(dtype=np.int64),
                 "num_max_likelihood": pd.Series(dtype=np.int64),
             }
@@ -724,9 +662,6 @@ def make_long_df(df):
             ),
             "selected_recombination": np.repeat(
                 df["selected_recombination"].to_numpy(dtype=np.int8, copy=False), k
-            ),
-            "selected_switch_cause": np.repeat(
-                df["selected_switch_cause"].to_numpy(dtype=object, copy=False), k
             ),
             "num_min_likelihood": np.repeat(
                 df["num_min_likelihood"].to_numpy(dtype=np.int64, copy=False), k
