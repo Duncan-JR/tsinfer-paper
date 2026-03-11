@@ -14,13 +14,14 @@ def randomise_haplotypes(num_nodes, num_sites, seed=1):
     return reference, query
 
 class LSHMM:
-    def __init__(self, reference, query, mu, rho, scale_by_n=False):
+    def __init__(self, reference, query, mu, rho, eps=1e-8, scale_by_n=False):
         num_nodes = reference.shape[0]
         num_sites = reference.shape[1]
         self.num_nodes = num_nodes
         self.num_sites = num_sites
         self.mu = mu
         self.rho = rho
+        self.eps = eps
         self.scale_by_n = scale_by_n
         self.L_norm_mat = np.zeros((num_nodes, num_sites), dtype=float)
         self.L_mat = np.zeros((num_nodes, num_sites), dtype=float)
@@ -71,7 +72,7 @@ class LSHMM:
         
         self.max_likelihood_node[site] = max_L_node
         for u in range(self.num_nodes):
-            L_norm = self.L[u] / max_L
+            L_norm = max(self.L[u] / max_L, self.eps)
             self.L[u] = L_norm
             self.L_norm_mat[u, site] = L_norm
 
@@ -128,29 +129,31 @@ class AncestorHMM:
                 mismatch = False
             self.mismatch[u, site] = mismatch
             if mismatch:
-                self.L[u] = 0
-            else:
-                if site == 0:
-                    self.L[u] = 2
+                if last_L == 0:
+                    self.L[u] = 0
                 else:
-                    if last_L <= 1:
-                        self.L[u] = 1
-                        self.recomb_required[u, site] = True
-                    else:
-                        self.L[u] = 2
+                    self.recomb_required[u, site] = True
+                    self.L[u] = 1
+            else:
+                if last_L == 0:
+                    self.L[u] = 2
+                    self.recomb_required[u, site] = True
+                else:
+                    self.L[u] = 3
             self.L_mat[u, site] = self.L[u]
-            self.L_norm_mat[u, site] = self.L[u]
             if self.L[u] > max_L:
                 max_L = self.L[u]
                 max_L_node = u
         
-        if max_L == 1:
-            for u in range(self.num_nodes):
-                if self.L[u] == 1:
-                    self.L[u] = 2
-                    self.L_norm_mat[u, site] = 2
-        elif max_L == 0:
+        if max_L == 0:
             raise Exception(f"All likelihoods are zero at site {site}")
+        
+        for u in range(self.num_nodes):
+            if self.L[u] == max_L:
+                self.L[u] = 1
+            else:
+                self.L[u] = 0
+            self.L_norm_mat[u,site] = self.L[u]
         self.max_likelihood_node[site] = max_L_node
 
     
@@ -171,7 +174,6 @@ class AncestorHMM:
         self.path = path
         self.num_switches = num_switches
         self.num_mismatches = num_mismatches
-        self.L_norm_mat = self.L_mat
         return num_mismatches, num_switches
         
 
