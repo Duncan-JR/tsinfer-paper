@@ -524,7 +524,7 @@ def plot_paths_interactively(df):
             "plot_paths_interactively requires ipywidgets and IPython display"
         ) from exc
 
-    from likelihoods import summarise_paths
+    from tsinfer.logging import make_path_df
 
     combined_df = pd.DataFrame(df, copy=False)
     required = {
@@ -543,7 +543,7 @@ def plot_paths_interactively(df):
             f"{missing_str}"
         )
 
-    path_df = summarise_paths(combined_df).sort_values(
+    path_df = make_path_df(combined_df).sort_values(
         ["num_errors", "path_id"], kind="mergesort"
     ).reset_index(drop=True)
 
