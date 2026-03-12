@@ -12,10 +12,7 @@ import tsinfer
 import tsinfer.logging as tsinfer_logging
 import msprime
 import math
-try:
-    from . import real_data
-except ImportError:
-    from lib import real_data
+import real_data
 
 
 def run_1kgp_inference(subset_num_sites,
