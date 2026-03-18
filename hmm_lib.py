@@ -5,13 +5,150 @@ from matplotlib import cm
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.lines import Line2D
 import msprime
+from numba import njit
     
 def randomise_haplotypes(num_nodes, num_sites, seed=1):
     np.random.seed(seed)
     reference = np.random.randint(0, 2, (num_nodes, num_sites))
     query = np.random.randint(0, 2, num_sites)
     return reference, query
+
+
+@njit
+def _update_site_numba(
+    site,
+    L,
+    reference,
+    query,
+    recomb_required,
+    mismatch,
+    L_mat,
+    L_norm_mat,
+    max_likelihood_node,
+    max_likelihood,
+    rho,
+    mu,
+    n,
+    eps,
+):
+    max_L = -1.0
+    max_L_node = -1
+    p_recomb = rho / n
+    query_site = query[site]
+
+    for u in range(L.shape[0]):
+        recomb_required[u, site] = False
+        mismatch[u, site] = True
+
+        p_last = L[u]
+        p_no_recomb = p_last * (1 - rho + p_recomb)
+        if p_no_recomb > p_recomb:
+            p_transition = p_no_recomb
+        else:
+            p_transition = p_recomb
+            recomb_required[u, site] = True
+
+        ref_allele = reference[u, site]
+        p_emission = mu
+        if query_site == ref_allele:
+            mismatch[u, site] = False
+            p_emission = 1 - mu
+        elif ref_allele == -1:
+            p_emission = 0.0
+
+        likelihood = p_transition * p_emission
+        L[u] = likelihood
+        L_mat[u, site] = likelihood
+        if likelihood > max_L:
+            max_L = likelihood
+            max_L_node = u
+
+    if max_L == 0.0:
+        return site
+
+    max_likelihood_node[site] = max_L_node
+    max_likelihood[site] = max_L
+    for u in range(L.shape[0]):
+        L_norm = max(L[u] / max_L, eps)
+        L[u] = L_norm
+        L_norm_mat[u, site] = L_norm
+    return -1
+
+
+@njit
+def _run_numba(
+    L,
+    reference,
+    query,
+    recomb_required,
+    mismatch,
+    L_mat,
+    L_norm_mat,
+    max_likelihood_node,
+    max_likelihood,
+    path,
+    rho,
+    mu,
+    n,
+    eps,
+):
+    num_nodes = reference.shape[0]
+    num_sites = reference.shape[1]
+
+    for u in range(num_nodes):
+        L[u] = 1.0
+
+    for u in range(num_nodes):
+        for site in range(num_sites):
+            recomb_required[u, site] = False
+            mismatch[u, site] = True
+            L_mat[u, site] = 0.0
+            L_norm_mat[u, site] = 0.0
+
+    for site in range(num_sites):
+        max_likelihood_node[site] = -1
+        max_likelihood[site] = 0.0
+        path[site] = -1
+
+    for site in range(num_sites):
+        failed_site = _update_site_numba(
+            site,
+            L,
+            reference,
+            query,
+            recomb_required,
+            mismatch,
+            L_mat,
+            L_norm_mat,
+            max_likelihood_node,
+            max_likelihood,
+            rho,
+            mu,
+            n,
+            eps,
+        )
+        if failed_site != -1:
+            return failed_site, 0, 0
+
+    num_switches = 0
+    num_mismatches = 0
+    u = max_likelihood_node[num_sites - 1]
+    for site in range(num_sites - 1, -1, -1):
+        path[site] = u
+        num_mismatches += mismatch[u, site]
+        if recomb_required[u, site]:
+            num_switches += 1
+            if site == 0:
+                return site, 0, 0
+            new_u = max_likelihood_node[site - 1]
+            if u == new_u:
+                return site, 0, 0
+            u = new_u
+
+    return -1, num_mismatches, num_switches
 
 class LSHMM:
     def __init__(self, reference, query, mu, rho, eps=1e-8, scale_by_n=False):
@@ -31,72 +168,60 @@ class LSHMM:
         self.recomb_required = np.zeros((num_nodes, num_sites), dtype=bool)
         self.mismatch = np.ones((num_nodes, num_sites), dtype=bool)
         self.max_likelihood_node = np.full(num_sites, -1)
+        self.max_likelihood = np.zeros(num_sites)
         self.num_switches = 0
         self.num_mismatches = 0
         self.path_likelihood = 0.0
-        self.path = []
+        self.path = np.full(num_sites, -1, dtype=np.int64)
+        if self.scale_by_n:
+            self.n = self.num_nodes
+        else:
+            self.n = 1
     
 
     def update_site(self, site):
-        max_L = -1
-        max_L_node = -1
-        rho = self.rho
-        mu = self.mu
-        if self.scale_by_n:
-            n = self.num_nodes
-        else:
-            n = 1
-        
-        for u in range(self.num_nodes):
-            p_last = self.L[u]
-            p_no_recomb = p_last * (1 - rho + rho / n)
-            p_recomb = rho / n
-            if p_no_recomb > p_recomb:
-                p_transition = p_no_recomb
-            else:
-                p_transition = p_recomb
-                self.recomb_required[u, site] = True
-
-            p_emission = mu
-            if self.query[site] == self.reference[u, site]:
-                self.mismatch[u, site] = False
-                p_emission = 1 - self.mu
-            self.L[u] = p_transition * p_emission
-            self.L_mat[u, site] = self.L[u]
-            if self.L[u] > max_L:
-                max_L = self.L[u]
-                max_L_node = u
-        
-        if max_L == 0:
+        failed_site = _update_site_numba(
+            site,
+            self.L,
+            self.reference,
+            self.query,
+            self.recomb_required,
+            self.mismatch,
+            self.L_mat,
+            self.L_norm_mat,
+            self.max_likelihood_node,
+            self.max_likelihood,
+            self.rho,
+            self.mu,
+            self.n,
+            self.eps,
+        )
+        if failed_site != -1:
             raise Exception(f"All likelihoods are zero at site {site}")
-        
-        self.max_likelihood_node[site] = max_L_node
-        for u in range(self.num_nodes):
-            L_norm = max(self.L[u] / max_L, self.eps)
-            self.L[u] = L_norm
-            self.L_norm_mat[u, site] = L_norm
 
     def run(self):
-        for site in range(0, self.num_sites):
-            self.update_site(site)
-        path = []
-        num_switches = 0
-        num_mismatches = 0
-        u = int(self.max_likelihood_node[self.num_sites - 1])
-        for site in range(self.num_sites - 1, -1, -1):
-            path.append(int(u))
-            num_mismatches += self.mismatch[u, site]
-            if self.recomb_required[u, site]:
-                num_switches += 1
-                assert site > 0
-                new_u = self.max_likelihood_node[site-1]
-                assert u != new_u
-                u = new_u
-        path.reverse()
-        self.path = path
+        failed_site, num_mismatches, num_switches = _run_numba(
+            self.L,
+            self.reference,
+            self.query,
+            self.recomb_required,
+            self.mismatch,
+            self.L_mat,
+            self.L_norm_mat,
+            self.max_likelihood_node,
+            self.max_likelihood,
+            self.path,
+            self.rho,
+            self.mu,
+            self.n,
+            self.eps,
+        )
+        if failed_site != -1:
+            raise Exception(f"All likelihoods are zero at site {failed_site}")
+
         self.num_switches = num_switches
         self.num_mismatches = num_mismatches
-        self.path_likelihood = self.rho**num_switches * self.mu**num_mismatches
+        self.path_likelihood = np.log10(self.max_likelihood).sum()
         return num_mismatches, num_switches
 
 class AncestorHMM:
@@ -164,13 +289,13 @@ class AncestorHMM:
         num_switches = 0
         num_mismatches = 0
         u = int(self.max_likelihood_node[self.num_sites - 1])
+        path = np.full(self.num_sites, -1)
         for site in range(self.num_sites - 1, -1, -1):
-            path.append(int(u))
+            path[site] = int(u)
             num_mismatches += self.mismatch[u, site]
             if self.recomb_required[u, site]:
                 num_switches += 1                
                 u = self.max_likelihood_node[site-1]
-        path.reverse()
         self.path = path
         self.num_switches = num_switches
         self.num_mismatches = num_mismatches
@@ -447,8 +572,11 @@ def plot_hmm(
     col_span = cell_width + col_gap
     row_span = like_text_gap + like_height + like_geno_gap + cell_height + row_gap
 
+    path = getattr(hmm, "path", None)
+    has_path = path is not None and len(path) > 0
+
     extra_right = 50
-    if getattr(hmm, "path", None):
+    if has_path:
         box_gap = col_gap
         summary_w = cell_width * 3.8
         extra_right = box_gap + summary_w
@@ -572,9 +700,9 @@ def plot_hmm(
         )
 
     # Viterbi path overlay (genotype cells)
-    if getattr(hmm, "path", None):
+    if has_path:
         half_gap = col_gap / 2
-        for s, u in enumerate(hmm.path):
+        for s, u in enumerate(path):
             if u is None or u < 0:
                 continue
             x = label_col_width + s * col_span
@@ -585,7 +713,7 @@ def plot_hmm(
             )
             if s == hmm.num_sites - 1:
                 continue
-            u_next = hmm.path[s + 1]
+            u_next = path[s + 1]
             if u_next is None or u_next < 0:
                 continue
             y_next = nodes_top + u_next * row_span + like_text_gap + like_height + like_geno_gap
@@ -617,8 +745,8 @@ def plot_hmm(
                     f'stroke-linecap="square" />'
                 )
         # Summary box to the right of the final path node
-        last_idx = len(hmm.path) - 1
-        u_last = hmm.path[last_idx]
+        last_idx = len(path) - 1
+        u_last = path[last_idx]
         if u_last is not None and u_last >= 0:
             x_last = label_col_width + last_idx * col_span
             y_last = nodes_top + u_last * row_span + like_text_gap + like_height + like_geno_gap
@@ -664,6 +792,241 @@ def plot_hmm(
 
 def show_hmm(hmm, **kwargs):
     display(HTML(plot_hmm(hmm, **kwargs)))
+
+
+def plot_hmm_heatmap(
+    hmm,
+    likelihood_type="norm",
+    cmap="viridis",
+    figsize=(14, 8),
+    missing_color="#f0f0f0",
+):
+    if likelihood_type == "norm":
+        likelihood_mat = np.asarray(hmm.L_norm_mat, dtype=np.float64)
+        title_suffix = "normalised likelihood"
+    elif likelihood_type in {"raw", "unnorm"}:
+        likelihood_mat = np.asarray(hmm.L_mat, dtype=np.float64)
+        title_suffix = "likelihood"
+    else:
+        raise ValueError("likelihood_type must be 'norm', 'unnorm', or 'raw'")
+
+    reference = np.asarray(hmm.reference)
+    missing_mask = reference == -1
+    valid_mask = np.isfinite(likelihood_mat) & ~missing_mask
+    if not np.any(valid_mask):
+        raise ValueError("No finite likelihood values available to plot")
+
+    valid_values = likelihood_mat[valid_mask]
+
+    base_cmap = plt.get_cmap(cmap)
+    heat_cmap = LinearSegmentedColormap.from_list(
+        f"{cmap}_high", base_cmap(np.linspace(0.4, 1.0, 256))
+    )
+    base_cmap = base_cmap.with_extremes(bad=missing_color)
+    heat_cmap.set_bad(missing_color)
+    plot_mask = missing_mask | ~np.isfinite(likelihood_mat)
+    use_eps_floor = likelihood_type == "norm" and getattr(hmm, "eps", 0) > 0
+
+    if use_eps_floor:
+        eps_value = float(hmm.eps)
+        threshold_mask = valid_mask & np.isclose(likelihood_mat, eps_value)
+        non_threshold_mask = valid_mask & ~threshold_mask
+        mapped_values = np.zeros_like(likelihood_mat, dtype=np.float64)
+
+        threshold_eps = max(np.finfo(np.float64).eps, abs(eps_value) * 1e-12)
+        legend_min = eps_value + threshold_eps
+
+        if np.any(non_threshold_mask):
+            non_threshold_values = likelihood_mat[non_threshold_mask]
+            max_non_threshold = float(np.max(non_threshold_values))
+            if max_non_threshold <= legend_min:
+                mapped_values[non_threshold_mask] = 0.4
+            else:
+                scaled = (
+                    np.clip(non_threshold_values, legend_min, max_non_threshold) - legend_min
+                ) / (max_non_threshold - legend_min)
+                mapped_values[non_threshold_mask] = 0.4 + 0.6 * scaled
+        else:
+            max_non_threshold = legend_min * (1 + 1e-12)
+
+        mapped_values[threshold_mask] = 0.0
+        plot_values = np.ma.array(mapped_values, mask=plot_mask)
+        image_cmap = base_cmap
+        image_vmin = 0.0
+        image_vmax = 1.0
+    else:
+        vmin = float(np.min(valid_values))
+        vmax = float(np.max(valid_values))
+        if vmax <= vmin:
+            vmax = vmin + 1e-12
+        plot_values = np.ma.array(likelihood_mat, mask=plot_mask)
+        image_cmap = heat_cmap
+        image_vmin = vmin
+        image_vmax = vmax
+
+    fig, ax = plt.subplots(figsize=figsize)
+    image = ax.imshow(
+        plot_values,
+        aspect="auto",
+        interpolation="nearest",
+        cmap=image_cmap,
+        vmin=image_vmin,
+        vmax=image_vmax,
+        origin="upper",
+    )
+
+    ax.set_xlabel("Site")
+    ax.set_ylabel("Ancestor")
+    ax.set_title(f"LSHMM {title_suffix} heatmap")
+
+    path = getattr(hmm, "path", None)
+    has_path = path is not None and len(path) > 0
+    if has_path:
+        path = np.asarray(path, dtype=np.int64)
+        valid_path_mask = path >= 0
+        if np.any(valid_path_mask):
+            x = np.arange(len(path), dtype=np.float64)
+            y = path.astype(np.float64)
+            ax.plot(x[valid_path_mask], y[valid_path_mask], color="red", linewidth=1.6)
+
+            site_idx = np.flatnonzero(valid_path_mask)
+            mismatch_sites = site_idx[hmm.mismatch[path[site_idx], site_idx]]
+            recomb_sites = site_idx[hmm.recomb_required[path[site_idx], site_idx]]
+
+            if mismatch_sites.size > 0:
+                ax.scatter(
+                    mismatch_sites,
+                    path[mismatch_sites],
+                    marker="x",
+                    s=36,
+                    color="red",
+                    linewidths=1.4,
+                    zorder=4,
+                )
+            if recomb_sites.size > 0:
+                ax.scatter(
+                    recomb_sites,
+                    path[recomb_sites],
+                    marker="s",
+                    s=38,
+                    facecolors="none",
+                    edgecolors="orange",
+                    linewidths=1.6,
+                    zorder=4,
+                )
+
+    handles = [
+        Line2D([0], [0], color="red", lw=1.8, label="path"),
+        Line2D(
+            [0],
+            [0],
+            color="red",
+            marker="x",
+            linestyle="None",
+            markersize=7,
+            markeredgewidth=1.4,
+            label=f"mismatch (n={int(hmm.num_mismatches)})",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color="orange",
+            marker="s",
+            markerfacecolor="none",
+            linestyle="None",
+            markersize=7,
+            markeredgewidth=1.4,
+            label=f"recombination (n={int(hmm.num_switches)})",
+        ),
+        Patch(facecolor=missing_color, edgecolor="none", label="missing"),
+    ]
+
+    max_xticks = min(12, hmm.num_sites)
+    if max_xticks > 0:
+        xticks = np.linspace(0, hmm.num_sites - 1, num=max_xticks, dtype=int)
+        ax.set_xticks(np.unique(xticks))
+
+    if hmm.num_nodes > 30:
+        ax.set_yticks(np.linspace(0, hmm.num_nodes - 1, num=10, dtype=int))
+
+    fig.subplots_adjust(right=0.80)
+    ax_pos = ax.get_position()
+    top = ax_pos.y1
+    bottom = ax_pos.y0
+    total_height = top - bottom
+    legend_x = ax_pos.x1 + 0.02
+    cbar_width = 0.022
+    legend_box_h = total_height * 0.18
+    legend_gap = total_height * 0.04
+    legend_box_y = bottom
+    colorbar_bottom = legend_box_y + legend_box_h + legend_gap
+
+    if use_eps_floor:
+        gap_height = total_height * 0.04
+        threshold_height = total_height * 0.06
+        main_height = top - colorbar_bottom - gap_height - threshold_height
+        main_y = top - main_height
+        threshold_y = colorbar_bottom
+        high_vmax = max(max_non_threshold, legend_min * (1 + 1e-12))
+
+        main_cax = fig.add_axes([legend_x, main_y, cbar_width, main_height])
+        high_sm = plt.cm.ScalarMappable(
+            norm=plt.Normalize(vmin=legend_min, vmax=high_vmax),
+            cmap=heat_cmap,
+        )
+        high_sm.set_array([])
+        high_cbar = fig.colorbar(high_sm, cax=main_cax)
+        high_cbar.set_label(title_suffix)
+
+        eps_label = np.format_float_scientific(eps_value, precision=0)
+        mid_ticks = np.array([0.2, 0.4, 0.6, 0.8], dtype=np.float64)
+        valid_mid_ticks = mid_ticks[
+            np.logical_and(mid_ticks > legend_min, mid_ticks < high_vmax)
+        ]
+        tick_values = np.concatenate(
+            [np.array([legend_min], dtype=np.float64), valid_mid_ticks, np.array([high_vmax])]
+        )
+        high_cbar.set_ticks(tick_values.tolist())
+        high_cbar.set_ticklabels(
+            [f"{eps_label} + ε"]
+            + [f"{tick:.1g}" for tick in valid_mid_ticks]
+            + [f"{high_vmax:.2g}"]
+        )
+
+        threshold_ax = fig.add_axes([legend_x, threshold_y, cbar_width, threshold_height])
+        threshold_ax.add_patch(
+            plt.Rectangle((0.0, 0.0), 1.0, 1.0, color=base_cmap(0.0), linewidth=0)
+        )
+        threshold_ax.set_xlim(0.0, 1.0)
+        threshold_ax.set_ylim(0.0, 1.0)
+        threshold_ax.set_xticks([])
+        threshold_ax.set_yticks([])
+        threshold_ax.text(
+            1.25,
+            0.5,
+            eps_label,
+            ha="left",
+            va="center",
+            transform=threshold_ax.transAxes,
+        )
+    else:
+        main_cax = fig.add_axes([legend_x, colorbar_bottom, cbar_width, top - colorbar_bottom])
+        cbar = fig.colorbar(image, cax=main_cax)
+        cbar.set_label(title_suffix)
+
+    legend_box_x = legend_x
+    legend_box_w = 0.18
+    legend_ax = fig.add_axes([legend_box_x, legend_box_y, legend_box_w, legend_box_h])
+    legend_ax.set_axis_off()
+    legend_ax.legend(
+        handles=handles,
+        loc="upper left",
+        frameon=True,
+        fancybox=False,
+        borderaxespad=0.0,
+    )
+
+    return fig, ax
 
 
 class HMMViz:
