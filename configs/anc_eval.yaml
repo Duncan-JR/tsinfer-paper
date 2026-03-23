@@ -8,11 +8,11 @@ error_probs_path: "data/external/EmpiricalErrorPlatinum1000G.csv"
 sims:
   - model: "OutOfAfrica_4J17"
     contig: "chr20"
-    left: 2e7
-    right: 4e7
-    samples: {"CEU": 5000, "CHB": 1000, "YRI": 1000}
-    num_reps: 3
-    seed: 3
+    left: 2e6
+    right: 4e6
+    samples: {"CEU": 100, "CHB": 100, "YRI": 100}
+    num_reps: 1
+    seed: 2
   # - model: "OutOfAfrica_4J17"
   #   contig: "chr20"
   #   left: 1e5
@@ -22,22 +22,31 @@ sims:
   #   seed: 2
 
 error_configs:
-  - genotype_errors: 'disabled'
-    switch_error_rate: 0
-    mispolarisation_error_rate: 0
+  - empgeno: "off"
+    unifgeno: 1e-1
+    phase: 5e-3
+    mispol: 1e-2
     name: "none"
-  - genotype_errors: 'enabled'
-    switch_error_rate: 0
-    mispolarisation_error_rate: 0
-    name: "genotype"
-  - genotype_errors: 'disabled'
-    switch_error_rate: 5e-3
-    mispolarisation_error_rate: 0
-    name: "phasing"
-  - genotype_errors: 'disabled'
-    switch_error_rate: 0
-    mispolarisation_error_rate: 1e-2
-    name: "mispolarisation"
+  # - empgeno: "on"
+  #   unifgeno: 0
+  #   phase: 0
+  #   mispol: 0
+  #   name: "empirical"
+  # - empgeno: "off"
+  #   unifgeno: 1e-2
+  #   phase: 0
+  #   mispol: 0
+  #   name: "uniform"
+  # - empgeno: "off"
+  #   unifgeno: 0
+  #   phase: 5e-3
+  #   mispol: 0
+  #   name: "phasing"
+  # - empgeno: "off"
+  #   unifgeno: 0
+  #   phase: 0
+  #   mispol: 1e-2
+  #   name: "mispolarisation"
 
 versions:
   - 0.4
