@@ -131,24 +131,28 @@ def _run_numba(
             eps,
         )
         if failed_site != -1:
-            return failed_site, 0, 0
+            return failed_site, 0, 0, 0
 
-    num_switches = 0
+    num_forced_switches = 0
+    num_score_switches = 0
     num_mismatches = 0
     u = max_likelihood_node[num_sites - 1]
     for site in range(num_sites - 1, -1, -1):
         path[site] = u
         num_mismatches += mismatch[u, site]
         if recomb_required[u, site]:
-            num_switches += 1
             if site == 0:
-                return site, 0, 0
+                return site, 0, 0, 0
+            if reference[u, site - 1] == -1:
+                num_forced_switches += 1
+            else:
+                num_score_switches += 1
             new_u = max_likelihood_node[site - 1]
             if u == new_u:
-                return site, 0, 0
+                return site, 0, 0, 0
             u = new_u
 
-    return -1, num_mismatches, num_switches
+    return -1, num_mismatches, num_forced_switches, num_score_switches
 
 class LSHMM:
     def __init__(self, reference, query, mu, rho, eps=1e-8, scale_by_n=False):
@@ -169,7 +173,8 @@ class LSHMM:
         self.mismatch = np.ones((num_nodes, num_sites), dtype=bool)
         self.max_likelihood_node = np.full(num_sites, -1)
         self.max_likelihood = np.zeros(num_sites)
-        self.num_switches = 0
+        self.num_forced_switches = 0
+        self.num_score_switches = 0
         self.num_mismatches = 0
         self.path_likelihood = 0.0
         self.path = np.full(num_sites, -1, dtype=np.int64)
@@ -200,7 +205,7 @@ class LSHMM:
             raise Exception(f"All likelihoods are zero at site {site}")
 
     def run(self):
-        failed_site, num_mismatches, num_switches = _run_numba(
+        failed_site, num_mismatches, num_forced_switches, num_score_switches = _run_numba(
             self.L,
             self.reference,
             self.query,
@@ -219,10 +224,10 @@ class LSHMM:
         if failed_site != -1:
             raise Exception(f"All likelihoods are zero at site {failed_site}")
 
-        self.num_switches = num_switches
+        self.num_forced_switches = num_forced_switches
+        self.num_score_switches = num_score_switches
         self.num_mismatches = num_mismatches
         self.path_likelihood = np.log10(self.max_likelihood).sum()
-        return num_mismatches, num_switches
 
 class AncestorHMM:
     def __init__(self, reference, query):
@@ -800,7 +805,25 @@ def plot_hmm_heatmap(
     cmap="viridis",
     figsize=(14, 8),
     missing_color="#f0f0f0",
+    hide_path=False,
 ):
+    try:
+        from bokeh.layouts import column, row
+        from bokeh.models import ColorBar, ColumnDataSource, CustomJS, Div, LinearColorMapper, Range1d
+        from bokeh.plotting import figure
+    except ImportError as err:
+        raise ImportError(
+            "plot_hmm_heatmap now requires bokeh in the active Python environment"
+        ) from err
+
+    def _mpl_palette(name, start, stop, size=256):
+        cmap_obj = cm.get_cmap(name)
+        palette = []
+        for t in np.linspace(start, stop, size):
+            r, g, b, _ = cmap_obj(float(t))
+            palette.append(f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}")
+        return palette
+
     if likelihood_type == "norm":
         likelihood_mat = np.asarray(hmm.L_norm_mat, dtype=np.float64)
         title_suffix = "normalised likelihood"
@@ -817,216 +840,397 @@ def plot_hmm_heatmap(
         raise ValueError("No finite likelihood values available to plot")
 
     valid_values = likelihood_mat[valid_mask]
-
-    base_cmap = plt.get_cmap(cmap)
-    heat_cmap = LinearSegmentedColormap.from_list(
-        f"{cmap}_high", base_cmap(np.linspace(0.4, 1.0, 256))
-    )
-    base_cmap = base_cmap.with_extremes(bad=missing_color)
-    heat_cmap.set_bad(missing_color)
     plot_mask = missing_mask | ~np.isfinite(likelihood_mat)
     use_eps_floor = likelihood_type == "norm" and getattr(hmm, "eps", 0) > 0
+    full_palette = _mpl_palette(cmap, 0.0, 1.0)
+    high_palette = _mpl_palette(cmap, 0.4, 1.0)
 
     if use_eps_floor:
         eps_value = float(hmm.eps)
         threshold_mask = valid_mask & np.isclose(likelihood_mat, eps_value)
         non_threshold_mask = valid_mask & ~threshold_mask
-        mapped_values = np.zeros_like(likelihood_mat, dtype=np.float64)
+        display_values = np.full_like(likelihood_mat, np.nan, dtype=np.float64)
 
         threshold_eps = max(np.finfo(np.float64).eps, abs(eps_value) * 1e-12)
         legend_min = eps_value + threshold_eps
 
+        display_values[threshold_mask] = 0.0
         if np.any(non_threshold_mask):
             non_threshold_values = likelihood_mat[non_threshold_mask]
             max_non_threshold = float(np.max(non_threshold_values))
             if max_non_threshold <= legend_min:
-                mapped_values[non_threshold_mask] = 0.4
+                display_values[non_threshold_mask] = 0.4
             else:
                 scaled = (
                     np.clip(non_threshold_values, legend_min, max_non_threshold) - legend_min
                 ) / (max_non_threshold - legend_min)
-                mapped_values[non_threshold_mask] = 0.4 + 0.6 * scaled
+                display_values[non_threshold_mask] = 0.4 + 0.6 * scaled
         else:
             max_non_threshold = legend_min * (1 + 1e-12)
-
-        mapped_values[threshold_mask] = 0.0
-        plot_values = np.ma.array(mapped_values, mask=plot_mask)
-        image_cmap = base_cmap
-        image_vmin = 0.0
-        image_vmax = 1.0
+        display_values[plot_mask] = np.nan
+        heat_mapper = LinearColorMapper(
+            palette=full_palette,
+            low=0.0,
+            high=1.0,
+            nan_color=missing_color,
+        )
+        legend_mapper = LinearColorMapper(
+            palette=high_palette,
+            low=legend_min,
+            high=max(max_non_threshold, legend_min * (1 + 1e-12)),
+            nan_color=missing_color,
+        )
+        eps_label = np.format_float_scientific(eps_value, precision=0)
     else:
         vmin = float(np.min(valid_values))
         vmax = float(np.max(valid_values))
         if vmax <= vmin:
             vmax = vmin + 1e-12
-        plot_values = np.ma.array(likelihood_mat, mask=plot_mask)
-        image_cmap = heat_cmap
-        image_vmin = vmin
-        image_vmax = vmax
+        display_values = np.array(likelihood_mat, copy=True, dtype=np.float64)
+        display_values[plot_mask] = np.nan
+        heat_mapper = LinearColorMapper(
+            palette=high_palette,
+            low=vmin,
+            high=vmax,
+            nan_color=missing_color,
+        )
+        legend_mapper = heat_mapper
 
-    fig, ax = plt.subplots(figsize=figsize)
-    image = ax.imshow(
-        plot_values,
-        aspect="auto",
-        interpolation="nearest",
-        cmap=image_cmap,
-        vmin=image_vmin,
-        vmax=image_vmax,
-        origin="upper",
+    reference_panel_size = np.count_nonzero(~missing_mask, axis=0)
+    num_nodes, num_sites = likelihood_mat.shape
+    plot_width = max(900, int(figsize[0] * 95))
+    heat_height = max(520, int(figsize[1] * 72))
+    hist_height = max(140, int(figsize[1] * 18))
+    side_width = 240
+
+    x_range = Range1d(-0.5, num_sites - 0.5)
+    y_range = Range1d(num_nodes - 0.5, -0.5)
+
+    heat = figure(
+        width=plot_width,
+        height=heat_height,
+        x_range=x_range,
+        y_range=y_range,
+        tools="pan,wheel_zoom,box_zoom,reset,save",
+        active_scroll="wheel_zoom",
+        toolbar_location="above",
+        output_backend="webgl",
+        title=f"LSHMM {title_suffix} heatmap",
     )
-
-    ax.set_xlabel("Site")
-    ax.set_ylabel("Ancestor")
-    ax.set_title(f"LSHMM {title_suffix} heatmap")
+    heat.image(
+        image=[display_values],
+        x=-0.5,
+        y=-0.5,
+        dw=num_sites,
+        dh=num_nodes,
+        color_mapper=heat_mapper,
+    )
+    heat.xaxis.visible = False
+    heat.yaxis.axis_label = "Ancestor"
+    heat.xgrid.visible = False
+    heat.ygrid.visible = False
 
     path = getattr(hmm, "path", None)
-    has_path = path is not None and len(path) > 0
+    has_path = (not hide_path) and path is not None and len(path) > 0
+    mismatch_sites = np.array([], dtype=np.int64)
+    forced_switch_sites = np.array([], dtype=np.int64)
+    score_switch_sites = np.array([], dtype=np.int64)
     if has_path:
         path = np.asarray(path, dtype=np.int64)
         valid_path_mask = path >= 0
         if np.any(valid_path_mask):
-            x = np.arange(len(path), dtype=np.float64)
-            y = path.astype(np.float64)
-            ax.plot(x[valid_path_mask], y[valid_path_mask], color="red", linewidth=1.6)
-
             site_idx = np.flatnonzero(valid_path_mask)
             mismatch_sites = site_idx[hmm.mismatch[path[site_idx], site_idx]]
-            recomb_sites = site_idx[hmm.recomb_required[path[site_idx], site_idx]]
-
-            if mismatch_sites.size > 0:
-                ax.scatter(
-                    mismatch_sites,
-                    path[mismatch_sites],
-                    marker="x",
-                    s=36,
-                    color="red",
-                    linewidths=1.4,
-                    zorder=4,
+            switch_sites = site_idx[hmm.recomb_required[path[site_idx], site_idx]]
+            if switch_sites.size > 0:
+                forced_mask = reference[path[switch_sites], switch_sites - 1] == -1
+                forced_switch_sites = switch_sites[forced_mask]
+                score_switch_sites = switch_sites[~forced_mask]
+            step_x = []
+            step_y = []
+            prev_site = int(site_idx[0])
+            prev_node = float(path[prev_site])
+            step_x.append(float(prev_site) - 0.5)
+            step_y.append(prev_node)
+            for site in site_idx[1:]:
+                site = int(site)
+                node = float(path[site])
+                step_x.extend([float(site) - 0.5, float(site) - 0.5])
+                step_y.extend([prev_node, node])
+                prev_site = site
+                prev_node = node
+            line_source = ColumnDataSource(
+                data=dict(x=np.asarray(step_x, dtype=np.float64), y=np.asarray(step_y, dtype=np.float64))
+            )
+            mismatch_source = ColumnDataSource(
+                data=dict(
+                    x=mismatch_sites.astype(np.float64),
+                    y=path[mismatch_sites].astype(np.float64),
                 )
-            if recomb_sites.size > 0:
-                ax.scatter(
-                    recomb_sites,
-                    path[recomb_sites],
-                    marker="s",
-                    s=38,
-                    facecolors="none",
-                    edgecolors="orange",
-                    linewidths=1.6,
-                    zorder=4,
+            )
+            forced_switch_source = ColumnDataSource(
+                data=dict(
+                    x=forced_switch_sites.astype(np.float64) - 0.5,
+                    y=path[forced_switch_sites].astype(np.float64),
                 )
+            )
+            score_switch_source = ColumnDataSource(
+                data=dict(
+                    x=score_switch_sites.astype(np.float64) - 0.5,
+                    y=path[score_switch_sites].astype(np.float64),
+                )
+            )
+            heat.line("x", "y", source=line_source, line_color="red", line_width=2)
+            heat.scatter(
+                "x",
+                "y",
+                source=mismatch_source,
+                marker="x",
+                size=8,
+                line_color="red",
+                fill_color="red",
+            )
+            heat.scatter(
+                "x",
+                "y",
+                source=forced_switch_source,
+                marker="triangle",
+                size=10,
+                line_color="green",
+                fill_color="green",
+            )
+            heat.scatter(
+                "x",
+                "y",
+                source=score_switch_source,
+                marker="square",
+                size=9,
+                line_color="orange",
+                fill_alpha=0.0,
+            )
 
-    handles = [
-        Line2D([0], [0], color="red", lw=1.8, label="path"),
-        Line2D(
-            [0],
-            [0],
-            color="red",
-            marker="x",
-            linestyle="None",
-            markersize=7,
-            markeredgewidth=1.4,
-            label=f"mismatch (n={int(hmm.num_mismatches)})",
-        ),
-        Line2D(
-            [0],
-            [0],
-            color="orange",
-            marker="s",
-            markerfacecolor="none",
-            linestyle="None",
-            markersize=7,
-            markeredgewidth=1.4,
-            label=f"recombination (n={int(hmm.num_switches)})",
-        ),
-        Patch(facecolor=missing_color, edgecolor="none", label="missing"),
-    ]
-
-    max_xticks = min(12, hmm.num_sites)
-    if max_xticks > 0:
-        xticks = np.linspace(0, hmm.num_sites - 1, num=max_xticks, dtype=int)
-        ax.set_xticks(np.unique(xticks))
-
-    if hmm.num_nodes > 30:
-        ax.set_yticks(np.linspace(0, hmm.num_nodes - 1, num=10, dtype=int))
-
-    fig.subplots_adjust(right=0.80)
-    ax_pos = ax.get_position()
-    top = ax_pos.y1
-    bottom = ax_pos.y0
-    total_height = top - bottom
-    legend_x = ax_pos.x1 + 0.02
-    cbar_width = 0.022
-    legend_box_h = total_height * 0.18
-    legend_gap = total_height * 0.04
-    legend_box_y = bottom
-    colorbar_bottom = legend_box_y + legend_box_h + legend_gap
-
-    if use_eps_floor:
-        gap_height = total_height * 0.04
-        threshold_height = total_height * 0.06
-        main_height = top - colorbar_bottom - gap_height - threshold_height
-        main_y = top - main_height
-        threshold_y = colorbar_bottom
-        high_vmax = max(max_non_threshold, legend_min * (1 + 1e-12))
-
-        main_cax = fig.add_axes([legend_x, main_y, cbar_width, main_height])
-        high_sm = plt.cm.ScalarMappable(
-            norm=plt.Normalize(vmin=legend_min, vmax=high_vmax),
-            cmap=heat_cmap,
-        )
-        high_sm.set_array([])
-        high_cbar = fig.colorbar(high_sm, cax=main_cax)
-        high_cbar.set_label(title_suffix)
-
-        eps_label = np.format_float_scientific(eps_value, precision=0)
-        mid_ticks = np.array([0.2, 0.4, 0.6, 0.8], dtype=np.float64)
-        valid_mid_ticks = mid_ticks[
-            np.logical_and(mid_ticks > legend_min, mid_ticks < high_vmax)
-        ]
-        tick_values = np.concatenate(
-            [np.array([legend_min], dtype=np.float64), valid_mid_ticks, np.array([high_vmax])]
-        )
-        high_cbar.set_ticks(tick_values.tolist())
-        high_cbar.set_ticklabels(
-            [f"{eps_label} + ε"]
-            + [f"{tick:.1g}" for tick in valid_mid_ticks]
-            + [f"{high_vmax:.2g}"]
-        )
-
-        threshold_ax = fig.add_axes([legend_x, threshold_y, cbar_width, threshold_height])
-        threshold_ax.add_patch(
-            plt.Rectangle((0.0, 0.0), 1.0, 1.0, color=base_cmap(0.0), linewidth=0)
-        )
-        threshold_ax.set_xlim(0.0, 1.0)
-        threshold_ax.set_ylim(0.0, 1.0)
-        threshold_ax.set_xticks([])
-        threshold_ax.set_yticks([])
-        threshold_ax.text(
-            1.25,
-            0.5,
-            eps_label,
-            ha="left",
-            va="center",
-            transform=threshold_ax.transAxes,
-        )
-    else:
-        main_cax = fig.add_axes([legend_x, colorbar_bottom, cbar_width, top - colorbar_bottom])
-        cbar = fig.colorbar(image, cax=main_cax)
-        cbar.set_label(title_suffix)
-
-    legend_box_x = legend_x
-    legend_box_w = 0.18
-    legend_ax = fig.add_axes([legend_box_x, legend_box_y, legend_box_w, legend_box_h])
-    legend_ax.set_axis_off()
-    legend_ax.legend(
-        handles=handles,
-        loc="upper left",
-        frameon=True,
-        fancybox=False,
-        borderaxespad=0.0,
+    grid_source = ColumnDataSource(data=dict(x0=[], y0=[], x1=[], y1=[]))
+    heat.segment(
+        "x0",
+        "y0",
+        "x1",
+        "y1",
+        source=grid_source,
+        line_color="black",
+        line_alpha=0.18,
+        line_width=1,
     )
 
-    return fig, ax
+    hist_source = ColumnDataSource(
+        data=dict(
+            x=np.arange(num_sites, dtype=np.float64),
+            top=reference_panel_size.astype(np.float64),
+        )
+    )
+    hist = figure(
+        width=plot_width,
+        height=hist_height,
+        x_range=x_range,
+        y_axis_type="log",
+        toolbar_location=None,
+        output_backend="webgl",
+    )
+    hist_y_start = max(
+        0.8, float(np.min(reference_panel_size[reference_panel_size > 0])) * 0.8
+    ) if np.any(reference_panel_size > 0) else 0.8
+    hist.vbar(
+        x="x",
+        top="top",
+        bottom=hist_y_start,
+        width=1.0,
+        source=hist_source,
+        fill_color="#4c4c4c",
+        line_color=None,
+    )
+    hist.xaxis.axis_label = "Site"
+    hist.yaxis.axis_label = "Reference panel size"
+    hist.y_range.start = hist_y_start
+    hist.y_range.end = max(1.0, float(np.max(reference_panel_size)) * 1.1)
+    hist.xgrid.visible = False
+    event_top = hist.y_range.end
+    mismatch_hist_source = ColumnDataSource(
+        data=dict(
+            x0=mismatch_sites.astype(np.float64),
+            x1=mismatch_sites.astype(np.float64),
+            y0=np.full(mismatch_sites.size, hist_y_start, dtype=np.float64),
+            y1=np.full(mismatch_sites.size, event_top, dtype=np.float64),
+        )
+    )
+    forced_hist_source = ColumnDataSource(
+        data=dict(
+            x0=forced_switch_sites.astype(np.float64) - 0.5,
+            x1=forced_switch_sites.astype(np.float64) - 0.5,
+            y0=np.full(forced_switch_sites.size, hist_y_start, dtype=np.float64),
+            y1=np.full(forced_switch_sites.size, event_top, dtype=np.float64),
+        )
+    )
+    score_hist_source = ColumnDataSource(
+        data=dict(
+            x0=score_switch_sites.astype(np.float64) - 0.5,
+            x1=score_switch_sites.astype(np.float64) - 0.5,
+            y0=np.full(score_switch_sites.size, hist_y_start, dtype=np.float64),
+            y1=np.full(score_switch_sites.size, event_top, dtype=np.float64),
+        )
+    )
+    hist.segment("x0", "y0", "x1", "y1", source=mismatch_hist_source, line_color="red", line_width=1.5)
+    hist.segment("x0", "y0", "x1", "y1", source=forced_hist_source, line_color="green", line_width=1.5)
+    hist.segment("x0", "y0", "x1", "y1", source=score_hist_source, line_color="orange", line_width=1.5)
+
+    min_cell_pixels = 10
+    callback = CustomJS(
+        args=dict(
+            x_range=x_range,
+            y_range=y_range,
+            heat_plot=heat,
+            hist_source=hist_source,
+            counts_full=reference_panel_size.astype(float).tolist(),
+            grid_source=grid_source,
+            num_sites=num_sites,
+            num_nodes=num_nodes,
+            min_cell_pixels=min_cell_pixels,
+        ),
+        code="""
+            const start = Math.max(0, Math.floor(x_range.start + 0.5));
+            const end = Math.min(num_sites - 1, Math.ceil(x_range.end - 0.5));
+            const xs = [];
+            const tops = [];
+            for (let i = start; i <= end; i++) {
+                xs.push(i);
+                tops.push(counts_full[i]);
+            }
+            hist_source.data = {x: xs, top: tops};
+            hist_source.change.emit();
+
+            const xspan = Math.max(x_range.end - x_range.start, 1e-6);
+            const yspan = Math.max(Math.abs(y_range.end - y_range.start), 1e-6);
+            const frameWidth = Math.max(heat_plot.frame_width || heat_plot.width, 1);
+            const frameHeight = Math.max(heat_plot.frame_height || heat_plot.height, 1);
+            const showGrid =
+                frameWidth / xspan >= min_cell_pixels &&
+                frameHeight / yspan >= min_cell_pixels;
+
+            if (!showGrid) {
+                grid_source.data = {x0: [], y0: [], x1: [], y1: []};
+                grid_source.change.emit();
+                return;
+            }
+
+            const x0 = [];
+            const y0 = [];
+            const x1 = [];
+            const y1 = [];
+
+            const firstX = Math.max(-0.5, Math.floor(x_range.start) + 0.5);
+            const lastX = Math.min(num_sites - 0.5, Math.ceil(x_range.end) - 0.5);
+            for (let x = firstX; x <= lastX; x += 1) {
+                x0.push(x);
+                y0.push(-0.5);
+                x1.push(x);
+                y1.push(num_nodes - 0.5);
+            }
+
+            const yMin = Math.min(y_range.start, y_range.end);
+            const yMax = Math.max(y_range.start, y_range.end);
+            const firstY = Math.max(-0.5, Math.floor(yMin) + 0.5);
+            const lastY = Math.min(num_nodes - 0.5, Math.ceil(yMax) - 0.5);
+            for (let y = firstY; y <= lastY; y += 1) {
+                x0.push(-0.5);
+                y0.push(y);
+                x1.push(num_sites - 0.5);
+                y1.push(y);
+            }
+
+            grid_source.data = {x0, y0, x1, y1};
+            grid_source.change.emit();
+        """,
+    )
+    for prop in ("start", "end"):
+        x_range.js_on_change(prop, callback)
+        y_range.js_on_change(prop, callback)
+
+    colorbar_fig = figure(
+        width=110,
+        height=heat_height,
+        toolbar_location=None,
+        min_border=0,
+        outline_line_color=None,
+    )
+    colorbar_fig.xaxis.visible = False
+    colorbar_fig.yaxis.visible = False
+    colorbar_fig.grid.visible = False
+    colorbar = ColorBar(color_mapper=legend_mapper, title=title_suffix)
+    colorbar_fig.add_layout(colorbar, "right")
+
+    legend_items = []
+    if not hide_path:
+        legend_items.extend([
+            "<div style='display:flex; align-items:center; gap:8px; margin:4px 0;'>"
+            "<svg width='28' height='12'><line x1='1' y1='6' x2='27' y2='6' "
+            "style='stroke:red; stroke-width:2.5'/></svg><span>path</span></div>",
+            "<div style='display:flex; align-items:center; gap:8px; margin:4px 0;'>"
+            "<svg width='28' height='14'><line x1='6' y1='3' x2='18' y2='11' "
+            "style='stroke:red; stroke-width:2'/>"
+            "<line x1='18' y1='3' x2='6' y2='11' style='stroke:red; stroke-width:2'/></svg>"
+            f"<span>mismatch (n={int(hmm.num_mismatches)})</span></div>",
+            "<div style='display:flex; align-items:center; gap:8px; margin:4px 0;'>"
+            "<svg width='28' height='14'><polygon points='12,2 20,12 4,12' "
+            "style='fill:green; stroke:green; stroke-width:2'/></svg>"
+            f"<span>forced switch (n={int(forced_switch_sites.size)})</span></div>",
+            "<div style='display:flex; align-items:center; gap:8px; margin:4px 0;'>"
+            "<svg width='28' height='14'><rect x='6' y='2' width='12' height='10' "
+            "style='fill:none; stroke:orange; stroke-width:2'/></svg>"
+            f"<span>score-based switch (n={int(score_switch_sites.size)})</span></div>",
+        ])
+    legend_items.append(
+        "<div style='display:flex; align-items:center; gap:8px; margin:4px 0;'>"
+        f"<span style='display:inline-block; width:14px; height:14px; background:{missing_color}; "
+        "border:1px solid #777;'></span><span>missing</span></div>"
+    )
+    if use_eps_floor:
+        legend_items.insert(
+            0,
+            "<div style='display:flex; align-items:center; gap:8px; margin:4px 0;'>"
+            f"<span style='display:inline-block; width:14px; height:14px; background:{full_palette[0]}; "
+            "border:1px solid #777;'></span>"
+            f"<span>{eps_label}</span></div>",
+        )
+    symbol_legend = Div(
+        text=(
+            "<div style='border:1px solid #cccccc; padding:8px 10px; width:180px; "
+            "background:white; font-family:sans-serif; font-size:12px;'>"
+            + "".join(legend_items)
+            + "</div>"
+        ),
+        width=190,
+    )
+
+    right_col_children = [colorbar_fig]
+    if use_eps_floor:
+        right_col_children.append(
+            Div(
+                text=(
+                    "<div style='font-family:sans-serif; font-size:12px; margin:2px 0 8px 0;'>"
+                    f"<span style='display:inline-block; width:14px; height:14px; background:{full_palette[0]}; "
+                    "border:1px solid #777; vertical-align:middle; margin-right:6px;'></span>"
+                    f"{eps_label}"
+                    "</div>"
+                ),
+                width=110,
+            )
+        )
+    right_col_children.append(symbol_legend)
+
+    layout = row(
+        column(heat, hist, sizing_mode="fixed"),
+        column(*right_col_children, width=side_width, sizing_mode="fixed"),
+        sizing_mode="fixed",
+    )
+    return layout
 
 
 class HMMViz:

@@ -109,10 +109,13 @@ def plot_ancestor_boxplot(
     title="Ancestor lengths",
     y_log=False,
     plot_path=None,
-    color_dict={"new": "#ea801c","old": "#1a80bb","true": "#b8b8b8"},
+    color_dict={"new": "#ea801c", "old": "#1a80bb", "true": "#b8b8b8"},
+    version_dict={"new": "new", "old": "old"},
 ):
-    #df = df.copy()
-    #df = df.drop_duplicates(subset=["inferred_node", "version"], keep="first")
+    if set(version_dict.keys()) != {"new", "old"}:
+        raise ValueError("version_dict must contain exactly the keys 'new' and 'old'")
+
+    df = df.copy()
     if cutoffs is None:
         cutoffs = np.unique(np.percentile(df["inferred_time"], np.linspace(0, 100, 9)))
 
@@ -120,12 +123,16 @@ def plot_ancestor_boxplot(
     if var == "span":
         var_col = "inferred_span"
         true_col = "true_span"
-        var_labels = ["True", "Inferred (0.5.0)", "Inferred (0.4.1)"]
+        var_labels = [
+            "True",
+            f"Inferred ({version_dict['new']})",
+            f"Inferred ({version_dict['old']})",
+        ]
         colors = [color_dict["true"], color_dict["new"], color_dict["old"]]
     elif var == "overshoot":
         var_col = "overshoot"
         true_col = None
-        var_labels = ["0.5.0", "0.4.1"]
+        var_labels = [version_dict["new"], version_dict["old"]]
         colors = [color_dict["new"], color_dict["old"]]
     else:
         raise ValueError("var must be 'span' or 'overshoot'")
@@ -135,9 +142,21 @@ def plot_ancestor_boxplot(
     #return df
     parts = []
     if true_col is not None:
-        parts.append(df[["frequency_bin", true_col]].rename(columns={true_col: "value"}).assign(type="True"))
-    for version in ["0.4.1", "0.5.0"]:
-        part = df.loc[df["version"]==version, ["frequency_bin", var_col]].rename(columns={var_col: "value"}).assign(type=f"Inferred ({version})")
+        parts.append(
+            df[["frequency_bin", true_col]]
+            .rename(columns={true_col: "value"})
+            .assign(type="True")
+        )
+    for version_key in ["new", "old"]:
+        version_label = version_dict[version_key]
+        inferred_label = (
+            f"Inferred ({version_label})" if var == "span" else version_label
+        )
+        part = (
+            df.loc[df["version"] == version_label, ["frequency_bin", var_col]]
+            .rename(columns={var_col: "value"})
+            .assign(type=inferred_label)
+        )
         assert len(part) > 0
         parts.append(part)
     lengths_df = pd.concat(parts, ignore_index=True)
