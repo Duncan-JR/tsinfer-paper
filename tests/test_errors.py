@@ -56,7 +56,7 @@ class TestGenotypeErrorsFixedProbs:
             G_out[site] = g_in  
             
         probs_func = lambda freq: identity_probs
-        G_out_full = errors.add_call_genotype_errors(G_in, rng, probs_func)
+        G_out_full = errors.add_empirical_genotype_errors(G_in, rng, probs_func)
         assert_array_equal(G_out, G_out_full)
 
     def test_to_zero_matrix_fixes_genotypes(self, small_genotype_matrix, to_zero_probs, rng):
@@ -71,7 +71,7 @@ class TestGenotypeErrorsFixedProbs:
             G_out[site] = 0 
 
         probs_func = lambda freq: to_zero_probs
-        G_out_full = errors.add_call_genotype_errors(G_in, rng, probs_func)
+        G_out_full = errors.add_empirical_genotype_errors(G_in, rng, probs_func)
         assert_array_equal(G_out, G_out_full)
 
 class TestFetchEmpiricalProbs:
@@ -98,8 +98,23 @@ class TestFetchEmpiricalProbs:
         assert np.allclose(probs[:, :3], 0.0)
 
         G = rng.integers(0, 2, size=(3, 4, 2), dtype=np.int8)
-        out = errors.add_call_genotype_errors(G, rng, lambda f: probs)
+        out = errors.add_empirical_genotype_errors(G, rng, lambda f: probs)
         assert np.all(out == 1)  
+
+class TestUniformGenotypeErrors:
+    """
+    Test haploid-level uniform genotype error simulation.
+    """
+
+    def test_zero_uniform_rate(self, small_genotype_matrix, rng):
+        G_in = small_genotype_matrix
+        G_out = errors.add_uniform_genotype_errors(G_in, rng, unifgeno=0)
+        assert_array_equal(G_out, G_in)
+
+    def test_maximum_uniform_rate_flips_every_allele(self, small_genotype_matrix, rng):
+        G_in = small_genotype_matrix
+        G_out = errors.add_uniform_genotype_errors(G_in, rng, unifgeno=1)
+        assert_array_equal(G_out, 1 - G_in)
 
 
 class TestEncodeDecodeRoundTrip:
@@ -185,21 +200,27 @@ class TestInvalidGenotypeData:
     def test_multiallelic_not_allowed(self, rng):
         G = np.array([[[0, 1], [2, 2]]], dtype=np.int8)
         with pytest.raises(AssertionError):
-            errors.add_call_genotype_errors(G, rng, lambda f: np.eye(4))
+            errors.add_empirical_genotype_errors(G, rng, lambda f: np.eye(4))
+        with pytest.raises(AssertionError):
+            errors.add_uniform_genotype_errors(G, rng, unifgeno=0)
         with pytest.raises(AssertionError):
             errors.add_phase_switch_errors(G, switch_error_rate=0, rng=rng)
 
     def test_wrong_ploidy(self, rng):
         G = np.zeros((2, 3, 3), dtype=np.int8) 
         with pytest.raises(AssertionError):
-            errors.add_call_genotype_errors(G, rng, lambda f: np.eye(4))
+            errors.add_empirical_genotype_errors(G, rng, lambda f: np.eye(4))
+        with pytest.raises(AssertionError):
+            errors.add_uniform_genotype_errors(G, rng, unifgeno=0)
         with pytest.raises(AssertionError):
             errors.add_phase_switch_errors(G, switch_error_rate=0, rng=rng)
 
     def test_wrong_rank(self, rng):
         G = np.zeros((4, 2), dtype=np.int8)
         with pytest.raises(AssertionError):
-            errors.add_call_genotype_errors(G, rng, lambda f: np.eye(4))
+            errors.add_empirical_genotype_errors(G, rng, lambda f: np.eye(4))
+        with pytest.raises(AssertionError):
+            errors.add_uniform_genotype_errors(G, rng, unifgeno=0)
         with pytest.raises(AssertionError):
             errors.add_phase_switch_errors(G, switch_error_rate=0, rng=rng) 
 

@@ -117,13 +117,19 @@ def build_shared_site_maps(ts, anc_data_map):
     shared_pos = np.append(shared_pos, last_pos)
     return shared_pos, true_shared_idx, anc_shared_idx_maps
 
-def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotype_errors_type, switch_error_rate, mispol_error_rate, output_path):
-
-    if genotype_errors_type == "enabled":
-        geno_errors = True
-    else:
-        geno_errors = False
-
+def process_ancestor_chunk(
+    df,
+    ts,
+    ds,
+    anc_data_map,
+    rep,
+    error_profile,
+    empgeno,
+    unifgeno,
+    phase,
+    mispol,
+    output_path,
+):
     shared_pos, true_shared_idx, anc_shared_idx_map = build_shared_site_maps(
         ts, anc_data_map
     )
@@ -212,16 +218,17 @@ def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotyp
                         "true_node": true_node,
                         "replicate": rep,
                         "error_profile": error_profile,
-                        "genotype_errors_added": geno_errors,
-                        "switch_error_rate": switch_error_rate,
-                        "mispolarisation_error_rate": mispol_error_rate,
+                        "empgeno": empgeno,
+                        "unifgeno": unifgeno,
+                        "phase": phase,
+                        "mispol": mispol,
                         "version": version,
                         "side": side,
                         "inf_focal_site": row.inf_focal_site,
                         "true_focal_site": row.true_focal_site,
                         "focal_position": row.focal_position,
                         "focal_site_mispolarised": include_mispol[ds_focal_site],
-                        "focal_site_geno_error_count": geno_error_count[ds_focal_site],
+                        "focal_site_genotype_error_count": geno_error_count[ds_focal_site],
                         "allele_frequency": af,
                         "true_time": true_time,
                         "inferred_time": anc.time,
@@ -246,4 +253,3 @@ def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotyp
                     writer.writerow(record)
 
     print(f"[INFO] Finished writing chunk {output_path}")
-
