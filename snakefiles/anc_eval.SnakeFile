@@ -16,7 +16,6 @@ warnings.filterwarnings("ignore", category=FutureWarning, message=".*LMDBStore*"
 configfile: "configs/anc_eval.yaml"
 
 sys.path.append(config["tsinfer_dir"])
-sys.path.append(os.path.abspath("/well/kelleher/users/uuc395/tsinfer-paper"))
 import tsinfer
 from lib import simulation, utils, errors
 
@@ -78,7 +77,7 @@ rule all:
 
 rule simulate:
     output:
-        data_dir / "simulated" / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-raw.trees",
+        data_dir / "simulated" / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}.trees",
     threads: get_resource("simulate", "threads")
     resources:
         mem_mb=get_resource("simulate", "mem_mb"),
@@ -112,27 +111,27 @@ rule simulate:
         arg.dump(output[0])
 
 
-rule prune_simulated_ts:
-    input:
-        data_dir / "simulated" / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-raw.trees",
-    output:
-        data_dir
-        / "simulated"
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-pruned.trees",
-    threads: get_resource("prune_simulated_ts", "threads")
-    resources:
-        mem_mb=get_resource("prune_simulated_ts", "mem_mb"),
-        time_min=get_resource("prune_simulated_ts", "time_min"),
-    run:
-        arg = tskit.load(input[0])
-        arg = utils.prune_arg(arg)
-        arg.dump(output[0])
+# rule prune_simulated_ts:
+#     input:
+#         data_dir / "simulated" / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-raw.trees",
+#     output:
+#         data_dir
+#         / "simulated"
+#         / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-pruned.trees",
+#     threads: get_resource("prune_simulated_ts", "threads")
+#     resources:
+#         mem_mb=get_resource("prune_simulated_ts", "mem_mb"),
+#         time_min=get_resource("prune_simulated_ts", "time_min"),
+#     run:
+#         arg = tskit.load(input[0])
+#         arg = utils.prune_arg(arg)
+#         arg.dump(output[0])
 
 rule bio2zarr_convert:
     input:
         data_dir
         / "simulated"
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-pruned.trees",
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}.trees",
     output:
         data_dir
         / "zarr_vcfs"
@@ -292,7 +291,7 @@ checkpoint build_ancestor_chunks:
     input:
         data_dir
         / "simulated"
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-pruned.trees",
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}.trees",
         expand_ancestors_by_version,
     output:
         data_dir
@@ -343,7 +342,7 @@ rule process_ancestor_chunk:
         chunk=chunk_input,
         arg_path=data_dir
         / "simulated"
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-pruned.trees",
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}.trees",
         anc_data_paths=expand_ancestors_by_version,
         zarr_path=lambda wildcards: zarr_with_errors(wildcards) / ".mods_done",
     output:
@@ -529,4 +528,3 @@ rule aggregate_dataframes:
     run:
         dfs = [pd.read_csv(p) for p in input.dfs]
         pd.concat(dfs, ignore_index=True).to_csv(output[0], index=False)
-

@@ -8,6 +8,7 @@ import csv
 import math
 from tqdm import tqdm
 
+
 def prune_arg(arg):
     mutations_count = np.bincount(arg.mutations_site, minlength=arg.num_sites)
     recurrent = np.where(mutations_count > 1)[0]
@@ -23,7 +24,6 @@ def prune_arg(arg):
         np.isin(range(len(mutations)), muts_to_remove, invert=True)
     )
     return tables.tree_sequence()
-
 
 def add_zarr_variables(ds, output_path):
     G = ds.call_genotype
@@ -51,6 +51,55 @@ def add_zarr_variables(ds, output_path):
         )
     output_path.touch()
 
+def get_carrier_mrca(site, ts):
+    """
+    Return the mutation node for non-recurrent sites and, for recurrent sites,
+    the MRCA of the samples carrying the non-ancestral allele.
+    """
+    if len(site.mutations) == 0:
+        raise ValueError(f"Site {site.id} has no mutations")
+    if len(site.mutations) == 1:
+        return site.mutations[0].node
+    tree = ts.at(site.position)
+    ancestral_state = site.ancestral_state
+    mutation_by_id = {mutation.id: mutation for mutation in site.mutations}
+    child_ids = {mutation.id: [] for mutation in site.mutations}
+    sample_cache = {
+        mutation.id: set(tree.samples(mutation.node)) for mutation in site.mutations
+    }
+
+    roots = []
+    for mutation in site.mutations:
+        if mutation.parent == tskit.NULL:
+            roots.append(mutation.id)
+        else:
+            child_ids[mutation.parent].append(mutation.id)
+
+    def collect_carrier_samples(mutation_id):
+        mutation = mutation_by_id[mutation_id]
+        child_sample_ids = set()
+        carrier_sample_ids = set()
+
+        for child_id in child_ids[mutation_id]:
+            child_sample_ids.update(sample_cache[child_id])
+            carrier_sample_ids.update(collect_carrier_samples(child_id))
+
+        # Samples directly underneath this mutation that are not overridden by a
+        # descendant mutation inherit this mutation's state.
+        local_sample_ids = sample_cache[mutation_id] - child_sample_ids
+        if mutation.derived_state != ancestral_state:
+            carrier_sample_ids.update(local_sample_ids)
+        return carrier_sample_ids
+
+    carrier_sample_ids = set()
+    for root_id in roots:
+        carrier_sample_ids.update(collect_carrier_samples(root_id))
+
+    if len(carrier_sample_ids) == 0:
+        raise ValueError(f"Recurrent site {site.id} has no non-ancestral carriers")
+    if len(carrier_sample_ids) == 1:
+        return next(iter(carrier_sample_ids))
+    return tree.mrca(*sorted(carrier_sample_ids))
     
 def build_ancestor_chunks(anc_data_list, ts, output_dir, chunk_size, metadata_path):
     base_anc_data = anc_data_list[0]
@@ -71,8 +120,7 @@ def build_ancestor_chunks(anc_data_list, ts, output_dir, chunk_size, metadata_pa
             pos = inf_sites_pos[inf_site_id]
             true_site_id = np.searchsorted(ts_sites_pos, pos)
             site = ts.site(true_site_id)
-            assert len(site.mutations) == 1
-            true_node = site.mutations[0].node
+            true_node = get_carrier_mrca(site, ts)
             records.append(
                 {
                     "inf_focal_site": inf_site_id,
@@ -247,3 +295,40 @@ def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotyp
 
     print(f"[INFO] Finished writing chunk {output_path}")
 
+
+def reshape_side_dependent_columns(
+    df,
+    side_col="side",
+    side_dependent_cols=None,
+):
+    if side_dependent_cols is None:
+        side_dependent_cols = [
+            "true_boundary",
+            "inferred_boundary",
+            "overlap_boundary",
+            "overshoot",
+        ]
+
+    frame = pd.DataFrame(df, copy=False)
+    missing = set(side_dependent_cols + [side_col]).difference(frame.columns)
+    if missing:
+        raise ValueError(f"DataFrame missing required columns: {sorted(missing)}")
+
+    index_cols = [
+        col for col in frame.columns if col not in set(side_dependent_cols + [side_col])
+    ]
+    reshaped = (
+        frame.pivot(index=index_cols, columns=side_col, values=side_dependent_cols)
+        .sort_index(axis=1, level=[0, 1])
+        .reset_index()
+    )
+    renamed_columns = []
+    for col in reshaped.columns:
+        if not isinstance(col, tuple):
+            renamed_columns.append(col)
+        elif col[1] == "":
+            renamed_columns.append(col[0])
+        else:
+            renamed_columns.append(f"{col[0]}_{col[1]}")
+    reshaped.columns = renamed_columns
+    return reshaped
