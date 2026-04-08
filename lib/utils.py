@@ -189,6 +189,9 @@ def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotyp
     
     ds_variant_pos = ds.variant_position.values
     include_mispol = ~ds.variant_mispolarisation_mask.values
+    ds_shared_idx = np.searchsorted(ds_variant_pos, shared_pos[:-1])
+    assert np.array_equal(ds_variant_pos[ds_shared_idx], shared_pos[:-1])
+    shared_include_mispol = include_mispol[ds_shared_idx].astype("int8")
     allele_frequency = ds.variant_allele_frequency.values
     geno_error_count = ds.variant_genotype_error_count.values
     print(f"[INFO] Building dataframe", flush=True)
@@ -210,7 +213,9 @@ def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotyp
             assert len(segment) > 0
             true_left = segment[0]
             true_right = segment[-1] + 1
-            true_full_haplotype = (a_shared > 0).astype("int8")
+            true_full_haplotype = np.bitwise_xor(
+                (a_shared > 0).astype("int8"), shared_include_mispol
+            )
             true_time = ts.nodes_time[true_node]
             inf_node = row.inf_node
             true_boundary = {}
@@ -236,6 +241,7 @@ def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotyp
             olap_boundary = {}
             olap_boundary["left"] = shared_pos[olap_left]
             olap_boundary["right"] = shared_pos[olap_right]
+            olap_site_span = olap_right - olap_left
             olap_span = olap_boundary["right"] - olap_boundary["left"]
             true_olap = true_full_haplotype[olap_left:olap_right]
             for version, anc in anc_dict.items():
@@ -251,6 +257,9 @@ def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotyp
                 inferred_boundary["left"] = shared_pos[inf_left]
                 inferred_boundary["right"]  = shared_pos[inf_right]
                 inferred_span = inferred_boundary["right"] - inferred_boundary["left"]
+                num_errors = np.sum(errors)
+                num_should_be_0 = np.sum(should_be_0)
+                num_should_be_1 = np.sum(should_be_1)
                 ds_focal_site = np.searchsorted(ds_variant_pos, row.focal_position)
                 af = allele_frequency[ds_focal_site]
                 #assert math.isclose(af, anc.time, rel_tol=1e-4)
@@ -279,9 +288,12 @@ def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotyp
                         "inferred_span": inferred_span,
                         "overlap_boundary": olap_boundary[side],
                         "overlap_span": olap_span,
-                        "num_errors": np.sum(errors),
-                        "num_should_be_0": np.sum(should_be_0),
-                        "num_should_be_1": np.sum(should_be_1),
+                        "overlap_site_span": olap_site_span,
+                        "num_errors": num_errors,
+                        "num_errors_per_bp": num_errors/olap_span,
+                        "num_errors_per_site": num_errors/olap_site_span,
+                        "num_should_be_0": num_should_be_0,
+                        "num_should_be_1": num_should_be_1,
                     }
                     if side == "left":
                         overshoot = true_boundary["left"] - inferred_boundary["left"]
