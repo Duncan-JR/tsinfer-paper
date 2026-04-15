@@ -21,7 +21,7 @@ def generate_ancestors(input, output, log, version, threads, data_dir):
     if version == "1.0":
         tsinfer_path = os.path.abspath("/well/kelleher/users/uuc395/tsinfer")
     elif version == "0.4":
-        tsinfer_path = os.path.abspath("/well/kelleher/users/uuc395/tsinfer-0.4")
+        tsinfer_path = os.path.abspath("/well/kelleher/users/uuc395/tsinfer-old")
     else:
         raise ValueError("Version must be either '1.0' or '0.4'")
 
