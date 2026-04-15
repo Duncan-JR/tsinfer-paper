@@ -6,6 +6,7 @@ import json
 import tskit
 import csv
 import math
+import warnings
 from tqdm import tqdm
 
 
@@ -51,7 +52,7 @@ def add_zarr_variables(ds, output_path):
         )
     output_path.touch()
 
-def get_carrier_mrca(site, ts):
+def get_carrier_mrca(site, ts, v):
     """
     Return the mutation node for non-recurrent sites and, for recurrent sites,
     the MRCA of the samples carrying the non-ancestral allele.
@@ -60,46 +61,20 @@ def get_carrier_mrca(site, ts):
         raise ValueError(f"Site {site.id} has no mutations")
     if len(site.mutations) == 1:
         return site.mutations[0].node
+        
     tree = ts.at(site.position)
     ancestral_state = site.ancestral_state
-    mutation_by_id = {mutation.id: mutation for mutation in site.mutations}
-    child_ids = {mutation.id: [] for mutation in site.mutations}
-    sample_cache = {
-        mutation.id: set(tree.samples(mutation.node)) for mutation in site.mutations
-    }
-
-    roots = []
-    for mutation in site.mutations:
-        if mutation.parent == tskit.NULL:
-            roots.append(mutation.id)
-        else:
-            child_ids[mutation.parent].append(mutation.id)
-
-    def collect_carrier_samples(mutation_id):
-        mutation = mutation_by_id[mutation_id]
-        child_sample_ids = set()
-        carrier_sample_ids = set()
-
-        for child_id in child_ids[mutation_id]:
-            child_sample_ids.update(sample_cache[child_id])
-            carrier_sample_ids.update(collect_carrier_samples(child_id))
-
-        # Samples directly underneath this mutation that are not overridden by a
-        # descendant mutation inherit this mutation's state.
-        local_sample_ids = sample_cache[mutation_id] - child_sample_ids
-        if mutation.derived_state != ancestral_state:
-            carrier_sample_ids.update(local_sample_ids)
-        return carrier_sample_ids
-
-    carrier_sample_ids = set()
-    for root_id in roots:
-        carrier_sample_ids.update(collect_carrier_samples(root_id))
-
-    if len(carrier_sample_ids) == 0:
-        raise ValueError(f"Recurrent site {site.id} has no non-ancestral carriers")
-    if len(carrier_sample_ids) == 1:
-        return next(iter(carrier_sample_ids))
-    return tree.mrca(*sorted(carrier_sample_ids))
+    v.decode(site.id)
+    derived = next(a for a in v.alleles if a is not None and a != ancestral_state)
+    carriers = v.samples[v.genotypes == v.alleles.index(derived)]
+    if len(carriers) == 0:
+        warnings.warn(
+            f"No carriers of the mutation at site {site.id} exist in the true ARG",
+            stacklevel=2,
+        )
+        return None
+    else:
+        return tree.mrca(*sorted(carriers))
     
 def build_ancestor_chunks(anc_data_list, ts, output_dir, chunk_size, metadata_path):
     base_anc_data = anc_data_list[0]
@@ -115,12 +90,15 @@ def build_ancestor_chunks(anc_data_list, ts, output_dir, chunk_size, metadata_pa
     records = []
     inf_sites_pos = np.append(base_anc_data.sites_position, base_anc_data.sequence_length)
     ts_sites_pos = np.append(ts.sites_position, ts.sequence_length)
+    variant = tskit.Variant(ts, isolated_as_missing=False)
     for inf_node, sites in enumerate(base_anc_data.ancestors_focal_sites):
         for inf_site_id in sites:
             pos = inf_sites_pos[inf_site_id]
             true_site_id = np.searchsorted(ts_sites_pos, pos)
             site = ts.site(true_site_id)
-            true_node = get_carrier_mrca(site, ts)
+            true_node = get_carrier_mrca(site, ts, variant)
+            if true_node is None:
+                continue
             records.append(
                 {
                     "inf_focal_site": inf_site_id,
