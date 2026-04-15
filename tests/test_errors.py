@@ -235,16 +235,30 @@ class TestUnbiasedMispolarise:
         ancestral_state = np.full(4, "A", dtype="<U1")
         return variant_allele, ancestral_state
 
+    @pytest.fixture(scope="class")
+    def singleton_mask(self):
+        return np.array([True, False, False, True], dtype=bool)
+
     def test_incorrect_ancestral_state(self, four_allele_example, rng):
         variant_allele, _ = four_allele_example
         wrong_ancestral_state = np.full(4, "T", dtype="<U1")
         with pytest.raises(AssertionError):
-            errors.unbiased_mispolarise(variant_allele, wrong_ancestral_state, 0.5, rng)
+            errors.unbiased_mispolarise(
+                variant_allele,
+                wrong_ancestral_state,
+                0.5,
+                rng,
+                singleton_mask=np.zeros(4, dtype=bool),
+            )
 
-    def test_zero_mispol_rate(self, four_allele_example, rng):
+    def test_zero_mispol_rate(self, four_allele_example, singleton_mask, rng):
         variant_allele, ancestral_state = four_allele_example
         include_mispol, mispol_ancestral = errors.unbiased_mispolarise(
-            variant_allele, ancestral_state, mispol_rate=0, rng=rng
+            variant_allele,
+            ancestral_state,
+            mispol_rate=0,
+            rng=rng,
+            singleton_mask=singleton_mask,
         )
         assert_array_equal(include_mispol, np.zeros(4, dtype=bool))
         assert_array_equal(mispol_ancestral, ancestral_state)
@@ -252,7 +266,11 @@ class TestUnbiasedMispolarise:
     def test_maximum_mispol_rate(self, four_allele_example, rng):
         variant_allele, ancestral_state = four_allele_example
         include_mispol, mispol_ancestral = errors.unbiased_mispolarise(
-            variant_allele, ancestral_state, mispol_rate=1, rng=rng
+            variant_allele,
+            ancestral_state,
+            mispol_rate=1,
+            rng=rng,
+            singleton_mask=np.zeros(4, dtype=bool),
         )
         assert_array_equal(include_mispol, np.ones(4, dtype=bool))
         assert_array_equal(mispol_ancestral, np.full(4, "T", dtype="<U1"))

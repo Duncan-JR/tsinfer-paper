@@ -5,3 +5,4 @@ notebooks/
 .snakemake/
 .ipynb_checkpoints/
 *.pdf
+configs/anc_eval.yaml

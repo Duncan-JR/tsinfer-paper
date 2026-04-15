@@ -6,7 +6,9 @@ import json
 import tskit
 import csv
 import math
+import warnings
 from tqdm import tqdm
+
 
 def prune_arg(arg):
     mutations_count = np.bincount(arg.mutations_site, minlength=arg.num_sites)
@@ -23,7 +25,6 @@ def prune_arg(arg):
         np.isin(range(len(mutations)), muts_to_remove, invert=True)
     )
     return tables.tree_sequence()
-
 
 def add_zarr_variables(ds, output_path):
     G = ds.call_genotype
@@ -51,6 +52,29 @@ def add_zarr_variables(ds, output_path):
         )
     output_path.touch()
 
+def get_carrier_mrca(site, ts, v):
+    """
+    Return the mutation node for non-recurrent sites and, for recurrent sites,
+    the MRCA of the samples carrying the non-ancestral allele.
+    """
+    if len(site.mutations) == 0:
+        raise ValueError(f"Site {site.id} has no mutations")
+    if len(site.mutations) == 1:
+        return site.mutations[0].node
+        
+    tree = ts.at(site.position)
+    ancestral_state = site.ancestral_state
+    v.decode(site.id)
+    derived = next(a for a in v.alleles if a is not None and a != ancestral_state)
+    carriers = v.samples[v.genotypes == v.alleles.index(derived)]
+    if len(carriers) == 0:
+        warnings.warn(
+            f"No carriers of the mutation at site {site.id} exist in the true ARG",
+            stacklevel=2,
+        )
+        return None
+    else:
+        return tree.mrca(*sorted(carriers))
     
 def build_ancestor_chunks(anc_data_list, ts, output_dir, chunk_size, metadata_path):
     base_anc_data = anc_data_list[0]
@@ -66,13 +90,15 @@ def build_ancestor_chunks(anc_data_list, ts, output_dir, chunk_size, metadata_pa
     records = []
     inf_sites_pos = np.append(base_anc_data.sites_position, base_anc_data.sequence_length)
     ts_sites_pos = np.append(ts.sites_position, ts.sequence_length)
+    variant = tskit.Variant(ts, isolated_as_missing=False)
     for inf_node, sites in enumerate(base_anc_data.ancestors_focal_sites):
         for inf_site_id in sites:
             pos = inf_sites_pos[inf_site_id]
             true_site_id = np.searchsorted(ts_sites_pos, pos)
             site = ts.site(true_site_id)
-            assert len(site.mutations) == 1
-            true_node = site.mutations[0].node
+            true_node = get_carrier_mrca(site, ts, variant)
+            if true_node is None:
+                continue
             records.append(
                 {
                     "inf_focal_site": inf_site_id,
@@ -147,6 +173,9 @@ def process_ancestor_chunk(
     
     ds_variant_pos = ds.variant_position.values
     include_mispol = ~ds.variant_mispolarisation_mask.values
+    ds_shared_idx = np.searchsorted(ds_variant_pos, shared_pos[:-1])
+    assert np.array_equal(ds_variant_pos[ds_shared_idx], shared_pos[:-1])
+    shared_include_mispol = include_mispol[ds_shared_idx].astype("int8")
     allele_frequency = ds.variant_allele_frequency.values
     geno_error_count = ds.variant_genotype_error_count.values
     print(f"[INFO] Building dataframe", flush=True)
@@ -168,7 +197,9 @@ def process_ancestor_chunk(
             assert len(segment) > 0
             true_left = segment[0]
             true_right = segment[-1] + 1
-            true_full_haplotype = (a_shared > 0).astype("int8")
+            true_full_haplotype = np.bitwise_xor(
+                (a_shared > 0).astype("int8"), shared_include_mispol
+            )
             true_time = ts.nodes_time[true_node]
             inf_node = row.inf_node
             true_boundary = {}
@@ -194,6 +225,7 @@ def process_ancestor_chunk(
             olap_boundary = {}
             olap_boundary["left"] = shared_pos[olap_left]
             olap_boundary["right"] = shared_pos[olap_right]
+            olap_site_span = olap_right - olap_left
             olap_span = olap_boundary["right"] - olap_boundary["left"]
             true_olap = true_full_haplotype[olap_left:olap_right]
             for version, anc in anc_dict.items():
@@ -209,6 +241,9 @@ def process_ancestor_chunk(
                 inferred_boundary["left"] = shared_pos[inf_left]
                 inferred_boundary["right"]  = shared_pos[inf_right]
                 inferred_span = inferred_boundary["right"] - inferred_boundary["left"]
+                num_errors = np.sum(errors)
+                num_should_be_0 = np.sum(should_be_0)
+                num_should_be_1 = np.sum(should_be_1)
                 ds_focal_site = np.searchsorted(ds_variant_pos, row.focal_position)
                 af = allele_frequency[ds_focal_site]
                 #assert math.isclose(af, anc.time, rel_tol=1e-4)
@@ -238,9 +273,12 @@ def process_ancestor_chunk(
                         "inferred_span": inferred_span,
                         "overlap_boundary": olap_boundary[side],
                         "overlap_span": olap_span,
-                        "num_errors": np.sum(errors),
-                        "num_should_be_0": np.sum(should_be_0),
-                        "num_should_be_1": np.sum(should_be_1),
+                        "overlap_site_span": olap_site_span,
+                        "num_errors": num_errors,
+                        "num_errors_per_bp": num_errors/olap_span,
+                        "num_errors_per_site": num_errors/olap_site_span,
+                        "num_should_be_0": num_should_be_0,
+                        "num_should_be_1": num_should_be_1,
                     }
                     if side == "left":
                         overshoot = true_boundary["left"] - inferred_boundary["left"]

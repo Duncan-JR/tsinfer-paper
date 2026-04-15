@@ -143,12 +143,17 @@ def add_phase_switch_errors(G_in, switch_error_rate, rng):
 
     return G_out, call_genotype_phase, sample_switch_count
 
-def unbiased_mispolarise(variant_allele, ancestral_state, mispol_rate, rng):
+def unbiased_mispolarise(
+    variant_allele, ancestral_state, mispol_rate, rng, singleton_mask
+):
     assert 0 <= mispol_rate <= 1
     num_sites = len(ancestral_state)
     ancestral, derived = variant_allele[:,0], variant_allele[:,1]
     assert np.array_equal(ancestral, ancestral_state)
+    singleton_mask = np.asarray(singleton_mask, dtype=bool)
+    assert singleton_mask.shape == (num_sites,)
     include_mispol = rng.random(num_sites) < mispol_rate
+    include_mispol &= ~singleton_mask
     mispol_ancestral = ancestral_state.copy()
     mispol_ancestral[include_mispol] = derived[include_mispol]
 
@@ -195,7 +200,14 @@ def add_errors(
     #Mispolarisation errors
     variant_allele = ds.variant_allele.values
     ancestral_state = ds.variant_ancestral_state.values
-    include_mispol, mispol_ancestral = unbiased_mispolarise(variant_allele, ancestral_state, mispol_error_rate, rng)
+    singleton_mask = ds.variant_singleton_mask.values
+    include_mispol, mispol_ancestral = unbiased_mispolarise(
+        variant_allele,
+        ancestral_state,
+        mispol_error_rate,
+        rng,
+        singleton_mask,
+    )
     add_xarray(new_vars, ~include_mispol, dims=["variants"], name="variant_mispolarisation_mask")
     add_xarray(new_vars, mispol_ancestral, dims=["variants"], name="variant_mispolarised_ancestral_state")
 
