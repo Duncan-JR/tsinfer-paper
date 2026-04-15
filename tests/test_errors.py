@@ -101,21 +101,6 @@ class TestFetchEmpiricalProbs:
         out = errors.add_empirical_genotype_errors(G, rng, lambda f: probs)
         assert np.all(out == 1)  
 
-class TestUniformGenotypeErrors:
-    """
-    Test haploid-level uniform genotype error simulation.
-    """
-
-    def test_zero_uniform_rate(self, small_genotype_matrix, rng):
-        G_in = small_genotype_matrix
-        G_out = errors.add_uniform_genotype_errors(G_in, rng, unifgeno=0)
-        assert_array_equal(G_out, G_in)
-
-    def test_maximum_uniform_rate_flips_every_allele(self, small_genotype_matrix, rng):
-        G_in = small_genotype_matrix
-        G_out = errors.add_uniform_genotype_errors(G_in, rng, unifgeno=1)
-        assert_array_equal(G_out, 1 - G_in)
-
 
 class TestEncodeDecodeRoundTrip:
     """
@@ -202,8 +187,6 @@ class TestInvalidGenotypeData:
         with pytest.raises(AssertionError):
             errors.add_empirical_genotype_errors(G, rng, lambda f: np.eye(4))
         with pytest.raises(AssertionError):
-            errors.add_uniform_genotype_errors(G, rng, unifgeno=0)
-        with pytest.raises(AssertionError):
             errors.add_phase_switch_errors(G, switch_error_rate=0, rng=rng)
 
     def test_wrong_ploidy(self, rng):
@@ -211,16 +194,12 @@ class TestInvalidGenotypeData:
         with pytest.raises(AssertionError):
             errors.add_empirical_genotype_errors(G, rng, lambda f: np.eye(4))
         with pytest.raises(AssertionError):
-            errors.add_uniform_genotype_errors(G, rng, unifgeno=0)
-        with pytest.raises(AssertionError):
             errors.add_phase_switch_errors(G, switch_error_rate=0, rng=rng)
 
     def test_wrong_rank(self, rng):
         G = np.zeros((4, 2), dtype=np.int8)
         with pytest.raises(AssertionError):
             errors.add_empirical_genotype_errors(G, rng, lambda f: np.eye(4))
-        with pytest.raises(AssertionError):
-            errors.add_uniform_genotype_errors(G, rng, unifgeno=0)
         with pytest.raises(AssertionError):
             errors.add_phase_switch_errors(G, switch_error_rate=0, rng=rng) 
 
