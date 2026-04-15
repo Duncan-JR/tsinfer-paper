@@ -143,13 +143,19 @@ def build_shared_site_maps(ts, anc_data_map):
     shared_pos = np.append(shared_pos, last_pos)
     return shared_pos, true_shared_idx, anc_shared_idx_maps
 
-def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotype_errors_type, switch_error_rate, mispol_error_rate, output_path):
-
-    if genotype_errors_type == "enabled":
-        geno_errors = True
-    else:
-        geno_errors = False
-
+def process_ancestor_chunk(
+    df,
+    ts,
+    ds,
+    anc_data_map,
+    rep,
+    error_profile,
+    empgeno,
+    unifgeno,
+    phase,
+    mispol,
+    output_path,
+):
     shared_pos, true_shared_idx, anc_shared_idx_map = build_shared_site_maps(
         ts, anc_data_map
     )
@@ -247,16 +253,17 @@ def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotyp
                         "true_node": true_node,
                         "replicate": rep,
                         "error_profile": error_profile,
-                        "genotype_errors_added": geno_errors,
-                        "switch_error_rate": switch_error_rate,
-                        "mispolarisation_error_rate": mispol_error_rate,
+                        "empgeno": empgeno,
+                        "unifgeno": unifgeno,
+                        "phase": phase,
+                        "mispol": mispol,
                         "version": version,
                         "side": side,
                         "inf_focal_site": row.inf_focal_site,
                         "true_focal_site": row.true_focal_site,
                         "focal_position": row.focal_position,
                         "focal_site_mispolarised": include_mispol[ds_focal_site],
-                        "focal_site_geno_error_count": geno_error_count[ds_focal_site],
+                        "focal_site_genotype_error_count": geno_error_count[ds_focal_site],
                         "allele_frequency": af,
                         "true_time": true_time,
                         "inferred_time": anc.time,
@@ -284,41 +291,3 @@ def process_ancestor_chunk(df, ts, ds, anc_data_map, rep, error_profile, genotyp
                     writer.writerow(record)
 
     print(f"[INFO] Finished writing chunk {output_path}")
-
-
-def reshape_side_dependent_columns(
-    df,
-    side_col="side",
-    side_dependent_cols=None,
-):
-    if side_dependent_cols is None:
-        side_dependent_cols = [
-            "true_boundary",
-            "inferred_boundary",
-            "overlap_boundary",
-            "overshoot",
-        ]
-
-    frame = pd.DataFrame(df, copy=False)
-    missing = set(side_dependent_cols + [side_col]).difference(frame.columns)
-    if missing:
-        raise ValueError(f"DataFrame missing required columns: {sorted(missing)}")
-
-    index_cols = [
-        col for col in frame.columns if col not in set(side_dependent_cols + [side_col])
-    ]
-    reshaped = (
-        frame.pivot(index=index_cols, columns=side_col, values=side_dependent_cols)
-        .sort_index(axis=1, level=[0, 1])
-        .reset_index()
-    )
-    renamed_columns = []
-    for col in reshaped.columns:
-        if not isinstance(col, tuple):
-            renamed_columns.append(col)
-        elif col[1] == "":
-            renamed_columns.append(col[0])
-        else:
-            renamed_columns.append(f"{col[0]}_{col[1]}")
-    reshaped.columns = renamed_columns
-    return reshaped

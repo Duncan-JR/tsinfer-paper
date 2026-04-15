@@ -18,12 +18,12 @@ warnings.filterwarnings("ignore", category=FutureWarning, message=".*LMDBStore i
 def generate_ancestors(input, output, log, version, threads, data_dir):
     """Generate ancestors from a tree sequence."""
 
-    if version == "1.0":
+    if version == "1.0" or version == "new":
         tsinfer_path = os.path.abspath("/well/kelleher/users/uuc395/tsinfer")
-    elif version == "0.4":
+    elif version == "0.4" or version == "old":
         tsinfer_path = os.path.abspath("/well/kelleher/users/uuc395/tsinfer-old")
     else:
-        raise ValueError("Version must be either '1.0' or '0.4'")
+        raise ValueError("Version must be either 1.0/new or 0.4/old")
 
     sys.path.append(tsinfer_path)
     import tsinfer

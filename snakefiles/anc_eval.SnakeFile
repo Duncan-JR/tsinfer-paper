@@ -54,17 +54,19 @@ def expand_data_frames():
         for model, contig, left, right, n, seed, rep in sim_metadata()
     ]
 
-def map_error_profiles(gerr, ser, mper):
+def map_error_profiles(empgeno, unifgeno, phase, mispol):
     output = "unknown"
     for err_conf in config["error_configs"]:
-        _gerr = err_conf["genotype_errors"]
-        _ser = float(err_conf["switch_error_rate"])
-        _mper = float(err_conf["mispolarisation_error_rate"])
+        _empgeno = err_conf["empgeno"]
+        _unifgeno = float(err_conf["unifgeno"])
+        _phase = float(err_conf["phase"])
+        _mispol = float(err_conf["mispol"])
         _name = err_conf["name"]
         if (
-            _gerr == gerr
-            and math.isclose(_ser, float(ser), rel_tol=1e-4)
-            and math.isclose(_mper, float(mper), rel_tol=1e-4)
+            _empgeno == empgeno
+            and math.isclose(_unifgeno, float(unifgeno), rel_tol=1e-4)
+            and math.isclose(_phase, float(phase), rel_tol=1e-4)
+            and math.isclose(_mispol, float(mispol), rel_tol=1e-4)
         ):
             output = _name
     return output
@@ -204,7 +206,7 @@ rule add_errors:
     output:
         data_dir
         / "zarr_vcfs"
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}.zarr"
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}.zarr"
         / ".mods_done",
     threads: get_resource("add_genotype_errors", "threads")
     resources:
@@ -214,18 +216,22 @@ rule add_errors:
         output_path = Path(output[0])
         ds = sgkit.load_dataset(Path(input[0]).parent, consolidated=False)
         error_csv_path = config["error_probs_path"]
-        genotype_errors_type=wildcards.gerr,
-        switch_error_rate=float(wildcards.ser)
-        mispol_error_rate=float(wildcards.mper)
-        assert 0 <= switch_error_rate <= 1
+        empirical_errors_enabled = wildcards.empgeno
+        unifgeno = float(wildcards.unifgeno)
+        phase_error_rate = float(wildcards.phase)
+        mispol_error_rate = float(wildcards.mispol)
+        assert empirical_errors_enabled in {"on", "off"}
+        assert 0 <= unifgeno <= 1
+        assert 0 <= phase_error_rate <= 1
         assert 0 <= mispol_error_rate <= 1
         seed = int(wildcards.seed) + int(wildcards.rep)
         errors.add_errors(
             ds=ds,
             output_path=output_path,
             error_csv_path=error_csv_path,
-            genotype_errors_type=wildcards.gerr,
-            switch_error_rate=switch_error_rate,
+            empirical_errors_enabled=empirical_errors_enabled,
+            unifgeno=unifgeno,
+            phase_error_rate=phase_error_rate,
             mispol_error_rate=mispol_error_rate,
             seed=seed,
         )
@@ -238,10 +244,11 @@ def zarr_with_errors(wildcards):
     n = wildcards.n
     seed = wildcards.seed
     rep = wildcards.rep
-    gerr = wildcards.gerr
-    ser = wildcards.ser
-    mper = wildcards.mper
-    return data_dir / "zarr_vcfs" / f"{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}.zarr"
+    empgeno = wildcards.empgeno
+    unifgeno = wildcards.unifgeno
+    phase = wildcards.phase
+    mispol = wildcards.mispol
+    return data_dir / "zarr_vcfs" / f"{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}.zarr"
 
 rule generate_ancestors:
     input:
@@ -249,11 +256,11 @@ rule generate_ancestors:
     output:
         data_dir
         / "ancestors"
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}-v{version}-ancestors.zarr",
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}-v{version}-ancestors.zarr",
     log:
         progress_dir
         / "generate_ancestors"
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}-v{version}.log",
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}-v{version}.log",
     threads: get_resource("generate_ancestors", "threads")
     resources:
         mem_mb=get_resource("generate_ancestors", "mem_mb"),
@@ -278,12 +285,13 @@ def expand_ancestors_by_version(wildcards):
     n = wildcards.n
     seed = wildcards.seed
     rep = wildcards.rep
-    gerr = wildcards.gerr
-    ser = wildcards.ser
-    mper = wildcards.mper
+    empgeno = wildcards.empgeno
+    unifgeno = wildcards.unifgeno
+    phase = wildcards.phase
+    mispol = wildcards.mispol
 
     return [
-        data_dir / "ancestors" / f"{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}-v{version}-ancestors.zarr"
+        data_dir / "ancestors" / f"{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}-v{version}-ancestors.zarr"
         for version in config["versions"]
     ]
 
@@ -296,7 +304,7 @@ checkpoint build_ancestor_chunks:
     output:
         data_dir
         / "chunks"
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}"
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}"
         / "metadata.json",
     threads: get_resource("build_ancestor_chunks", "threads")
     resources:
@@ -325,14 +333,15 @@ def chunk_input(wildcards):
     n = wildcards.n
     seed = wildcards.seed
     rep = wildcards.rep
-    gerr = wildcards.gerr
-    ser = wildcards.ser
-    mper = wildcards.mper
+    empgeno = wildcards.empgeno
+    unifgeno = wildcards.unifgeno
+    phase = wildcards.phase
+    mispol = wildcards.mispol
     chunk_id = wildcards.chunk_id
     return (
         data_dir 
         / "chunks" 
-        / f"{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}" 
+        / f"{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}" 
         / f"unprocessed-chunk-{chunk_id}.csv"
     )
 
@@ -348,12 +357,12 @@ rule process_ancestor_chunk:
     output:
         data_dir 
         / "chunks" 
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}" 
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}" 
         / "processed-chunk-{chunk_id}.csv"
     log:
         progress_dir 
         / "process_chunks" 
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}" 
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}" 
         / "processed-chunk-{chunk_id}.log"
     threads: get_resource("process_ancestor_chunk", "threads")
     resources:
@@ -377,12 +386,19 @@ rule process_ancestor_chunk:
                 }
                 print(f"[INFO] Starting DF generation", flush=True)
                 ds = sgkit.load_dataset(Path(input.zarr_path).parent, consolidated=False)
-                gerr = wildcards.gerr
-                ser = float(wildcards.ser)
-                mper = float(wildcards.mper)
-                error_profile = map_error_profiles(gerr=gerr, ser=ser, mper=mper)
+                empgeno = wildcards.empgeno
+                unifgeno = float(wildcards.unifgeno)
+                phase = float(wildcards.phase)
+                mispol = float(wildcards.mispol)
+                error_profile = map_error_profiles(
+                    empgeno=empgeno,
+                    unifgeno=unifgeno,
+                    phase=phase,
+                    mispol=mispol,
+                )
                 assert error_profile != "unknown", (
-                    f"Error profile not found for gerr={gerr}, ser={ser}, mper={mper}"
+                    "Error profile not found for "
+                    f"empgeno={empgeno}, unifgeno={unifgeno}, phase={phase}, mispol={mispol}"
                 )
                 utils.process_ancestor_chunk(
                     df=df,
@@ -391,9 +407,10 @@ rule process_ancestor_chunk:
                     anc_data_map=anc_data_map,
                     rep=wildcards.rep,
                     error_profile=error_profile,
-                    genotype_errors_type=wildcards.gerr,
-                    switch_error_rate=wildcards.ser,
-                    mispol_error_rate=wildcards.mper,
+                    empgeno=wildcards.empgeno,
+                    unifgeno=wildcards.unifgeno,
+                    phase=wildcards.phase,
+                    mispol=wildcards.mispol,
                     output_path=output[0],
                 )
 
@@ -406,9 +423,10 @@ def get_checkpoint(wildcards):
         n=wildcards.n,
         seed=wildcards.seed,
         rep=wildcards.rep,
-        gerr=wildcards.gerr,
-        ser=wildcards.ser,
-        mper=wildcards.mper,
+        empgeno=wildcards.empgeno,
+        unifgeno=wildcards.unifgeno,
+        phase=wildcards.phase,
+        mispol=wildcards.mispol,
     )
     return cp
 
@@ -423,7 +441,7 @@ rule process_all_chunks:
         lambda wildcards: expand(
             data_dir 
             / "chunks" 
-            / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}" 
+            / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}" 
             / "processed-chunk-{chunk_id}.csv",
             model=wildcards.model,
             contig=wildcards.contig,
@@ -432,16 +450,17 @@ rule process_all_chunks:
             n = wildcards.n,
             seed = wildcards.seed,
             rep=wildcards.rep,
-            gerr=wildcards.gerr,
-            ser=wildcards.ser,
-            mper=wildcards.mper,
+            empgeno=wildcards.empgeno,
+            unifgeno=wildcards.unifgeno,
+            phase=wildcards.phase,
+            mispol=wildcards.mispol,
             chunk_id=chunk_ids(wildcards),
         ),
     output:
         temp(
             data_dir 
             / "chunks" 
-            / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}" 
+            / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}" 
             / ".processed"
         ),
     run:
@@ -458,13 +477,13 @@ checkpoint aggregate_ancestor_chunks:
     input:
         processed=data_dir
         / "chunks"
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}" 
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}" 
         / ".processed",
         chunks=aggregate_chunk_paths,
     output:
         data_dir
         / "dataframes"
-        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}-ancestors.csv",
+        / "{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}-ancestors.csv",
     threads: get_resource("aggregate_ancestor_chunks", "threads")
     resources:
         mem_mb=get_resource("aggregate_ancestor_chunks", "mem_mb"),
@@ -486,13 +505,14 @@ def aggregated_dataframe_paths(wildcards):
             and int(seed) == int(wildcards.seed)
         ):
             for err_conf in config["error_configs"]:
-                gerr = err_conf["genotype_errors"]
-                ser = err_conf["switch_error_rate"]
-                mper = err_conf["mispolarisation_error_rate"]
+                empgeno = err_conf["empgeno"]
+                unifgeno = err_conf["unifgeno"]
+                phase = err_conf["phase"]
+                mispol = err_conf["mispol"]
                 paths.append(
                     data_dir
                     / "dataframes"
-                    / f"{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-gerr_{gerr}-ser{ser}-mper{mper}-ancestors.csv"
+                    / f"{model}-{contig}-L{left}-R{right}-n{n}-s{seed}-rep{rep}-empgeno-{empgeno}-unifgeno{unifgeno}-phase{phase}-mispol{mispol}-ancestors.csv"
                 )
     
     assert len(paths) > 0

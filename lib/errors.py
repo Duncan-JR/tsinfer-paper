@@ -47,7 +47,7 @@ def sample_genotypes_vectorised(genotypes, probs, rng):
     output_idx = (U[:, None] < cum_probs[input_idx]).argmax(axis=1)
     return decode_genotypes(output_idx)
 
-def add_call_genotype_errors(G_in, rng, probs_func, **kwargs):
+def add_empirical_genotype_errors(G_in, rng, probs_func, **kwargs):
     #no multiallelic sites
     assert len(np.unique(G_in)) <= 2 
     assert len(G_in.shape) == 3
@@ -65,6 +65,19 @@ def add_call_genotype_errors(G_in, rng, probs_func, **kwargs):
         probs = probs_func(freq, **kwargs)
         G_out[site, :, :] = sample_genotypes_vectorised(g, probs, rng)
     return G_out
+
+def add_uniform_genotype_errors(G_in, rng, unifgeno):
+    """
+    Independently flip each haploid allele with probability unifgeno.
+    """
+    assert 0 <= unifgeno <= 1
+    assert len(np.unique(G_in)) <= 2
+    assert len(G_in.shape) == 3
+    assert G_in.shape[2] == 2
+    assert G_in.dtype == np.int8
+
+    include_flip = rng.random(G_in.shape) < unifgeno
+    return np.bitwise_xor(G_in, include_flip.astype(np.int8))
 
 @njit
 def phase_switch_diplotype(d_in, d_out, phase_array, switch_sites):
@@ -146,30 +159,41 @@ def unbiased_mispolarise(
 
     return include_mispol, mispol_ancestral
 
-def add_errors(ds, output_path, error_csv_path, genotype_errors_type, switch_error_rate, mispol_error_rate, seed):
+def add_errors(
+    ds,
+    output_path,
+    error_csv_path,
+    empirical_errors_enabled,
+    unifgeno,
+    phase_error_rate,
+    mispol_error_rate,
+    seed,
+):
     def add_xarray(dict, array, dims, name):
         xarray = xr.DataArray(array, dims=dims, name=name)
         dict[name] = xarray
         
     new_vars = {}
-    error_df = pd.read_csv(error_csv_path, index_col=0)
     rng = np.random.default_rng(seed=seed)
     G_in = ds.call_genotype.values
 
     #Genotype errors
-    if genotype_errors_type == 'enabled':
-        G_geno_error = add_call_genotype_errors(G_in, rng, fetch_empirical_probs, df=error_df)
-    elif genotype_errors_type == 'disabled':
+    if empirical_errors_enabled == 'on':
+        error_df = pd.read_csv(error_csv_path, index_col=0)
+        G_geno_error = add_empirical_genotype_errors(G_in, rng, fetch_empirical_probs, df=error_df)
+    elif empirical_errors_enabled == 'off':
         G_geno_error = G_in
     else:
-        raise ValueError("Invalid genotype error type specified")
+        raise ValueError("Invalid empirical error setting specified")
+    if unifgeno > 0:
+        G_geno_error = add_uniform_genotype_errors(G_geno_error, rng, unifgeno)
     error_mask = G_geno_error == G_in
     genotype_error_count = np.sum(~error_mask, axis=(1,2))
     add_xarray(new_vars, error_mask, dims=["variants", "samples", "ploidy"], name="call_genotype_error_mask")
     add_xarray(new_vars, genotype_error_count, dims=["variants"], name="variant_genotype_error_count")
 
     #Phasing errors
-    G_out, call_genotype_phase, sample_switch_count = add_phase_switch_errors(G_geno_error, switch_error_rate, rng)
+    G_out, call_genotype_phase, sample_switch_count = add_phase_switch_errors(G_geno_error, phase_error_rate, rng)
     add_xarray(new_vars, call_genotype_phase, dims=["variants", "samples"], name="call_genotype_phase")
     add_xarray(new_vars, sample_switch_count, dims=["samples"], name="sample_phase_switch_count")
 
