@@ -8,6 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import sgkit
+import msprime
 from matplotlib.collections import PolyCollection
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.lines import Line2D
@@ -440,7 +441,7 @@ def _sorted_values(values):
     try:
         return sorted(unique_vals, key=float)
     except (TypeError, ValueError):
-        return list(unique_vals)
+        return sorted(unique_vals, key=str)
 
 
 def _get_frequency_column(frame):
@@ -463,6 +464,768 @@ def _build_version_palette(version_order, color_dict=None):
         else:
             palette[version] = default_colors.get(str(version), fallback[idx])
     return palette
+
+
+def _hapmap_file(hapmap_path, chrom):
+    filename = f"genetic_map_Hg38_{chrom}.txt"
+    path = os.path.join(hapmap_path, filename)
+    if os.path.exists(path) or os.path.isabs(hapmap_path):
+        return path
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    candidates = [os.path.join(repo_root, hapmap_path, filename)]
+    if hapmap_path.startswith("../"):
+        candidates.append(os.path.join(repo_root, hapmap_path[3:], filename))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return path
+
+
+def _hapmap_recomb_width(left_pos, right_pos, hapmap_path, chrom):
+    recomb_map = _hapmap_file(hapmap_path, chrom)
+    rate_map = msprime.RateMap.read_hapmap(recomb_map, position_col=1, rate_col=2)
+    left_pos = np.asarray(left_pos, dtype=np.float64)
+    right_pos = np.asarray(right_pos, dtype=np.float64)
+    return (
+        rate_map.get_cumulative_mass(right_pos)
+        - rate_map.get_cumulative_mass(left_pos)
+    )
+
+
+def _ensure_real_recomb_width(real_frame, hapmap_path, chrom):
+    if "recomb_width" in real_frame.columns:
+        return real_frame
+    if {"left_hap_boundary", "right_hap_boundary"}.issubset(real_frame.columns):
+        real_frame = real_frame.copy()
+        real_frame["recomb_width"] = _hapmap_recomb_width(
+            pd.to_numeric(real_frame["left_hap_boundary"], errors="coerce"),
+            pd.to_numeric(real_frame["right_hap_boundary"], errors="coerce"),
+            hapmap_path,
+            chrom,
+        )
+        return real_frame
+    if {"focal_position", "width"}.issubset(real_frame.columns):
+        real_frame = real_frame.copy()
+        focal_position = pd.to_numeric(
+            real_frame["focal_position"], errors="coerce"
+        ).to_numpy(dtype=np.float64, copy=False)
+        width = pd.to_numeric(real_frame["width"], errors="coerce").to_numpy(
+            dtype=np.float64,
+            copy=False,
+        )
+        real_frame["recomb_width"] = _hapmap_recomb_width(
+            focal_position - width / 2,
+            focal_position + width / 2,
+            hapmap_path,
+            chrom,
+        )
+        return real_frame
+    return real_frame
+
+
+def plot_error_rate_distributions(
+    df,
+    meta_df,
+    real_df=None,
+    real_meta_df=None,
+    num_bins=50,
+    units="bp",
+    hapmap_path="../data/HapMapII_GRCh38",
+    chrom="chr20",
+):
+    if real_df is not None and real_meta_df is None and np.isscalar(real_df):
+        num_bins = real_df
+        real_df = None
+    units = str(units).lower()
+    if units not in {"bp", "sites"}:
+        raise ValueError("units must be 'bp' or 'sites'")
+    if units == "bp":
+        obs_error_col = "obs_error_rate_per_bp"
+        true_error_col = "true_error_rate_per_bp"
+        true_meta_candidates = ("true_error_rate_per_bp",)
+        error_rate_xlabel = "Error rate per bp"
+    else:
+        obs_error_col = "obs_error_rate"
+        true_error_col = "true_error_rate"
+        true_meta_candidates = ("true_error_rate_per_site", "true_error_rate_all")
+        error_rate_xlabel = "Error rate per site"
+    frame = pd.DataFrame(df, copy=False)
+    meta = pd.DataFrame(meta_df, copy=False)
+    required_cols = {"width", "recomb_width", obs_error_col, true_error_col}
+    missing_cols = required_cols.difference(frame.columns)
+    if missing_cols:
+        raise ValueError(f"df is missing columns: {sorted(missing_cols)}")
+    if "genotyping_error" in frame.columns:
+        error_col = "genotyping_error"
+    elif "error" in frame.columns:
+        error_col = "error"
+    else:
+        raise ValueError("df must contain 'genotyping_error' or 'error'")
+    meta_required_cols = {"width", "error"}
+    missing_meta_cols = meta_required_cols.difference(meta.columns)
+    if missing_meta_cols:
+        raise ValueError(f"meta_df is missing columns: {sorted(missing_meta_cols)}")
+    true_error_rate_meta_col = next(
+        (column for column in true_meta_candidates if column in meta.columns),
+        None,
+    )
+    if true_error_rate_meta_col is None and units != "bp":
+        raise ValueError(f"meta_df is missing column: '{true_meta_candidates[0]}'")
+    if int(num_bins) < 1:
+        raise ValueError("num_bins must be at least 1")
+    num_bins = int(num_bins)
+
+    real_frame = None
+    real_datasets = []
+    real_hist_datasets = []
+    real_scatter_col = None
+    if real_df is not None:
+        real_frame = pd.DataFrame(real_df, copy=False)
+        real_required_cols = {"width"}
+        missing_real_cols = real_required_cols.difference(real_frame.columns)
+        if missing_real_cols:
+            raise ValueError(
+                f"real_df is missing columns: {sorted(missing_real_cols)}"
+            )
+        if "dataset" not in real_frame.columns:
+            real_frame = real_frame.copy()
+            real_frame["dataset"] = "real"
+        real_frame = _ensure_real_recomb_width(real_frame, hapmap_path, chrom)
+        real_datasets = _sorted_values(real_frame["dataset"].dropna())
+        real_hist_datasets = (
+            real_datasets if obs_error_col in real_frame.columns else []
+        )
+        if obs_error_col in real_frame.columns:
+            real_scatter_col = obs_error_col
+        elif "obs_error_rate" in real_frame.columns:
+            real_scatter_col = "obs_error_rate"
+    if real_meta_df is not None:
+        # Accepted for API symmetry with plot_genotype_coverage. The error-rate
+        # distributions use per-haplotype rows from real_df.
+        pd.DataFrame(real_meta_df, copy=False)
+
+    width_values = [frame["width"].dropna()]
+    if real_frame is not None:
+        width_values.append(real_frame["width"].dropna())
+    widths = _sorted_values(pd.concat(width_values, ignore_index=True))
+    if len(widths) == 0:
+        raise ValueError("No widths available to plot")
+
+    def _finite_values(values):
+        values = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(
+            dtype=np.float64, copy=False
+        )
+        return values[np.isfinite(values)]
+
+    def _panel_values(width, error, column):
+        subset = frame.loc[
+            (frame["width"] == width) & (frame[error_col] == error), column
+        ]
+        return _finite_values(subset)
+
+    def _real_panel_values(width, dataset):
+        if real_frame is None:
+            return np.array([], dtype=np.float64)
+        subset = real_frame.loc[
+            (real_frame["width"] == width) & (real_frame["dataset"] == dataset),
+            obs_error_col,
+        ]
+        return _finite_values(subset)
+
+    def _true_error_rate(width):
+        if true_error_rate_meta_col is None:
+            return None
+        candidates = meta.loc[
+            (meta["width"] == width) & (meta["error"] == "enabled"),
+            true_error_rate_meta_col,
+        ]
+        if len(candidates) == 0:
+            candidates = meta.loc[meta["width"] == width, true_error_rate_meta_col]
+        values = _finite_values(candidates)
+        if len(values) == 0:
+            return None
+        return float(values[0])
+
+    true_error_rate_by_width = {width: _true_error_rate(width) for width in widths}
+    all_values = []
+    for width in widths:
+        all_values.extend(_panel_values(width, "enabled", obs_error_col))
+        all_values.extend(_panel_values(width, "enabled", true_error_col))
+        all_values.extend(_panel_values(width, "disabled", obs_error_col))
+        for dataset in real_hist_datasets:
+            all_values.extend(_real_panel_values(width, dataset))
+        if units != "bp" and true_error_rate_by_width[width] is not None:
+            all_values.append(true_error_rate_by_width[width])
+    all_values = np.asarray(all_values, dtype=np.float64)
+    all_values = all_values[np.isfinite(all_values)]
+    if len(all_values) == 0:
+        raise ValueError("No finite error rates available to plot")
+    if np.any(all_values < 0):
+        raise ValueError("Error rates must be non-negative")
+
+    layout = _make_zero_gap_log_hist_layout(all_values, num_bins=num_bins)
+
+    colors = {
+        "true": "#1b9e77",
+        "obs": "#d95f02",
+        "null": "#7570b3",
+        "all": "#666666",
+        "adjusted": "#d62728",
+    }
+    real_palette = dict(
+        zip(real_datasets, sns.color_palette("Set2", n_colors=len(real_datasets)))
+    )
+    row_specs = [
+        {
+            "label": "Obs. error rate (with errors)",
+            "source": "simulated",
+            "error": "enabled",
+            "column": obs_error_col,
+            "color": colors["obs"],
+        },
+        {
+            "label": "True error rate",
+            "source": "simulated",
+            "error": "enabled",
+            "column": true_error_col,
+            "color": colors["true"],
+        },
+        {
+            "label": "Obs. error rate (no errors)",
+            "source": "simulated",
+            "error": "disabled",
+            "column": obs_error_col,
+            "color": colors["null"],
+        },
+    ]
+    for dataset in real_hist_datasets:
+        row_specs.append(
+            {
+                "label": f"Obs. error rate ({dataset})",
+                "source": "real",
+                "dataset": dataset,
+                "column": obs_error_col,
+                "color": real_palette[dataset],
+            }
+        )
+
+    n_cols = len(widths)
+    n_rows = len(row_specs)
+    fig = plt.figure(
+        figsize=(max(4.0 * n_cols, 16.0), max(2.3 * n_rows + 3.4, 10.0)),
+    )
+    outer_grid = fig.add_gridspec(
+        2,
+        1,
+        height_ratios=[max(2.3 * n_rows, 1.0), 3.2],
+        hspace=0.35,
+    )
+    hist_grid = outer_grid[0].subgridspec(n_rows, n_cols, wspace=0.2, hspace=0.3)
+    axes = np.empty((n_rows, n_cols), dtype=object)
+    for row_idx in range(n_rows):
+        for col_idx in range(n_cols):
+            axes[row_idx, col_idx] = fig.add_subplot(hist_grid[row_idx, col_idx])
+    positive_plot_edges = layout["positive_plot_edges"]
+    positive_widths = np.diff(positive_plot_edges)
+
+    def _adjusted_obs_mean(width):
+        with_errors = _panel_values(width, "enabled", obs_error_col)
+        no_errors = _panel_values(width, "disabled", obs_error_col)
+        if len(with_errors) == 0 or len(no_errors) == 0:
+            return None
+        value = float(np.mean(with_errors) - np.mean(no_errors))
+        if not np.isfinite(value):
+            return None
+        return max(0.0, value)
+
+    for col_idx, width in enumerate(widths):
+        line_value = true_error_rate_by_width[width]
+        adjusted_mean = _adjusted_obs_mean(width)
+        for row_idx, spec in enumerate(row_specs):
+            ax = axes[row_idx, col_idx]
+            color = spec["color"]
+            if spec["source"] == "real":
+                values = _real_panel_values(width, spec["dataset"])
+            else:
+                values = _panel_values(width, spec["error"], spec["column"])
+            if len(values) > 0:
+                zero_count, positive_counts = _count_zero_gap_log_hist(
+                    values,
+                    layout["positive_log_edges"],
+                )
+                if zero_count > 0:
+                    ax.bar(
+                        layout["zero_left"],
+                        zero_count,
+                        width=layout["zero_width"],
+                        align="edge",
+                        color=color,
+                        edgecolor="white",
+                        linewidth=0.35,
+                        alpha=0.6,
+                    )
+                if len(positive_counts) > 0 and np.sum(positive_counts) > 0:
+                    ax.bar(
+                        positive_plot_edges[:-1],
+                        positive_counts,
+                        width=positive_widths,
+                        align="edge",
+                        color=color,
+                        edgecolor="white",
+                        linewidth=0.35,
+                        alpha=0.6,
+                    )
+                counts = np.concatenate(([zero_count], positive_counts))
+                positive_count_values = counts[counts > 0]
+                if len(positive_count_values) > 0:
+                    ax.set_ylim(
+                        bottom=max(0.8, float(np.min(positive_count_values)) * 0.8)
+                    )
+                mean_value = float(np.mean(values))
+                mean_x = _map_zero_gap_log_value(mean_value, layout)
+                ax.axvline(
+                    mean_x,
+                    color=color,
+                    linestyle="--",
+                    linewidth=1.4,
+                    alpha=1.0,
+                    zorder=21,
+                )
+                ax.text(
+                    mean_x,
+                    0.96,
+                    "mean",
+                    color=color,
+                    transform=ax.get_xaxis_transform(),
+                    ha="left",
+                    va="top",
+                    zorder=22,
+                )
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No data",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                )
+            ax.set_yscale("log")
+            if (
+                spec["source"] == "simulated"
+                and spec["error"] == "enabled"
+                and line_value is not None
+                and units != "bp"
+            ):
+                ax.axvline(
+                    _map_zero_gap_log_value(line_value, layout),
+                    color=colors["all"],
+                    linestyle="--",
+                    linewidth=1.4,
+                    zorder=20,
+                )
+            if (
+                spec["source"] == "simulated"
+                and spec["error"] == "enabled"
+                and spec["column"] == obs_error_col
+                and adjusted_mean is not None
+            ):
+                ax.axvline(
+                    _map_zero_gap_log_value(adjusted_mean, layout),
+                    color=colors["adjusted"],
+                    linestyle="--",
+                    linewidth=1.4,
+                    zorder=23,
+                )
+            if row_idx == 0:
+                ax.set_title(f"width = {width}")
+            if col_idx == 0:
+                ax.set_ylabel(f"{spec['label']}\nCount")
+            else:
+                ax.set_ylabel("Count")
+            if row_idx == n_rows - 1:
+                ax.set_xlabel(error_rate_xlabel)
+            ax.set_xlim(*layout["xlim"])
+            ax.set_xticks(layout["tick_positions"])
+            ax.set_xticklabels(layout["tick_labels"])
+
+    def _mean_by_width(error, column):
+        values = []
+        for width in widths:
+            width_values = _panel_values(width, error, column)
+            values.append(
+                float(np.mean(width_values)) if len(width_values) > 0 else np.nan
+            )
+        return np.asarray(values, dtype=np.float64)
+
+    def _zero_lift_floor(*arrays):
+        values = np.concatenate(
+            [
+                np.asarray(array, dtype=np.float64).reshape(-1)
+                for array in arrays
+                if len(np.asarray(array).reshape(-1)) > 0
+            ]
+        )
+        values = values[np.isfinite(values) & (values > 0)]
+        return float(np.min(values) / 10) if len(values) > 0 else 1e-12
+
+    def _lift_zero_error_rates(values, floor):
+        values = np.asarray(values, dtype=np.float64).copy()
+        values[np.isfinite(values) & (values == 0)] = floor
+        return values
+
+    width_array = np.asarray(widths, dtype=np.float64)
+    mean_true = _mean_by_width("enabled", true_error_col)
+    mean_obs_enabled = _mean_by_width("enabled", obs_error_col)
+    mean_obs_disabled = _mean_by_width("disabled", obs_error_col)
+    meta_true_values = np.asarray(
+        [
+            value if value is not None else np.nan
+            for value in true_error_rate_by_width.values()
+        ],
+        dtype=np.float64,
+    )
+    enabled_frame = frame.loc[frame[error_col] == "enabled"]
+    disabled_frame = frame.loc[frame[error_col] == "disabled"]
+    has_real_recomb_panel = (
+        real_frame is not None
+        and real_scatter_col is not None
+        and "recomb_width" in real_frame.columns
+    )
+    zero_floor = _zero_lift_floor(
+        mean_true,
+        mean_obs_enabled,
+        mean_obs_disabled,
+        meta_true_values,
+        enabled_frame[true_error_col].to_numpy(dtype=np.float64, copy=False),
+        enabled_frame[obs_error_col].to_numpy(dtype=np.float64, copy=False),
+        disabled_frame[obs_error_col].to_numpy(dtype=np.float64, copy=False),
+        real_frame[real_scatter_col].to_numpy(dtype=np.float64, copy=False)
+        if has_real_recomb_panel
+        else [],
+    )
+
+    num_summary_panels = 5 if has_real_recomb_panel else 4
+    summary_grid = outer_grid[1].subgridspec(1, num_summary_panels, wspace=0.35)
+    summary_axes = [
+        fig.add_subplot(summary_grid[0, i]) for i in range(num_summary_panels)
+    ]
+    fig.summary_axes = summary_axes
+
+    ax = summary_axes[0]
+    positive_width_mask = np.isfinite(width_array) & (width_array > 0)
+    line_specs = [
+        (mean_true, colors["true"], "Mean true error rate"),
+        (mean_obs_enabled, colors["obs"], "Mean obs. error rate (with errors)"),
+        (mean_obs_disabled, colors["null"], "Mean obs. error rate (no errors)"),
+    ]
+    for values, color, label in line_specs:
+        y = _lift_zero_error_rates(values, zero_floor)
+        mask = positive_width_mask & np.isfinite(y) & (y > 0)
+        if np.any(mask):
+            ax.plot(
+                width_array[mask],
+                y[mask],
+                marker="o",
+                color=color,
+                label=label,
+            )
+    true_line_values = meta_true_values[np.isfinite(meta_true_values)]
+    if units != "bp" and len(true_line_values) > 0:
+        true_line_value = true_line_values[0]
+        if true_line_value == 0:
+            true_line_value = zero_floor
+        ax.axhline(
+            true_line_value,
+            color=colors["all"],
+            linestyle="--",
+            linewidth=1.4,
+        )
+    ax.set_title("a")
+    ax.set_xlabel("Width")
+    ax.set_ylabel(error_rate_xlabel)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+
+    scatter_specs = [
+        ("b", enabled_frame, true_error_col, colors["true"], "True error rate"),
+        (
+            "c",
+            enabled_frame,
+            obs_error_col,
+            colors["obs"],
+            "Obs. error rate (with errors)",
+        ),
+        (
+            "d",
+            disabled_frame,
+            obs_error_col,
+            colors["null"],
+            "Obs. error rate (no errors)",
+        ),
+    ]
+    recomb_floor = _zero_lift_floor(
+        enabled_frame["recomb_width"].to_numpy(dtype=np.float64, copy=False),
+        disabled_frame["recomb_width"].to_numpy(dtype=np.float64, copy=False),
+        real_frame["recomb_width"].to_numpy(dtype=np.float64, copy=False)
+        if has_real_recomb_panel
+        else [],
+    )
+    for ax, (panel, source_frame, column, color, ylabel) in zip(
+        summary_axes[1:],
+        scatter_specs,
+    ):
+        x = _lift_zero_error_rates(
+            pd.to_numeric(source_frame["recomb_width"], errors="coerce").to_numpy(
+                dtype=np.float64,
+                copy=False,
+            ),
+            recomb_floor,
+        )
+        y = _lift_zero_error_rates(
+            pd.to_numeric(source_frame[column], errors="coerce").to_numpy(
+                dtype=np.float64,
+                copy=False,
+            ),
+            zero_floor,
+        )
+        mask = np.isfinite(x) & (x > 0) & np.isfinite(y) & (y > 0)
+        ax.scatter(x[mask], y[mask], s=16, color=color, alpha=0.2, linewidths=0)
+        ax.set_title(panel)
+        ax.set_xlabel("Recombination width")
+        ax.set_ylabel(ylabel)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+
+    if has_real_recomb_panel:
+        ax = summary_axes[4]
+        for dataset in real_datasets:
+            dataset_frame = real_frame.loc[real_frame["dataset"] == dataset]
+            x = _lift_zero_error_rates(
+                pd.to_numeric(
+                    dataset_frame["recomb_width"], errors="coerce"
+                ).to_numpy(dtype=np.float64, copy=False),
+                recomb_floor,
+            )
+            y = _lift_zero_error_rates(
+                pd.to_numeric(
+                    dataset_frame[real_scatter_col], errors="coerce"
+                ).to_numpy(dtype=np.float64, copy=False),
+                zero_floor,
+            )
+            mask = np.isfinite(x) & (x > 0) & np.isfinite(y) & (y > 0)
+            ax.scatter(
+                x[mask],
+                y[mask],
+                s=16,
+                color=real_palette[dataset],
+                alpha=0.2,
+                linewidths=0,
+                label=dataset,
+            )
+        ax.set_title("e")
+        ax.set_xlabel("Recombination width")
+        ylabel = (
+            "Obs. error rate (real)"
+            if real_scatter_col == obs_error_col
+            else "Obs. error rate (real, per site)"
+        )
+        ax.set_ylabel(ylabel)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+
+    legend_handles = [
+        Patch(
+            facecolor=colors["true"],
+            edgecolor="none",
+            alpha=0.6,
+            label="True error rate",
+        ),
+        Patch(
+            facecolor=colors["obs"],
+            edgecolor="none",
+            alpha=0.6,
+            label="Obs. error rate (with errors)",
+        ),
+        Patch(
+            facecolor=colors["null"],
+            edgecolor="none",
+            alpha=0.6,
+            label="Obs. error rate (no errors)",
+        ),
+    ]
+    legend_handles.extend(
+        [
+            Patch(
+                facecolor=real_palette[dataset],
+                edgecolor="none",
+                alpha=0.6,
+                label=f"Obs. error rate ({dataset})",
+            )
+            for dataset in real_datasets
+        ]
+    )
+    line_handles = [
+        Line2D(
+            [0],
+            [0],
+            color=colors["true"],
+            linestyle="--",
+            linewidth=1.4,
+            label="Mean true error rate",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color=colors["obs"],
+            linestyle="--",
+            linewidth=1.4,
+            label="Mean obs. error rate (with errors)",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color=colors["null"],
+            linestyle="--",
+            linewidth=1.4,
+            label="Mean obs. error rate (no errors)",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color=colors["adjusted"],
+            linestyle="--",
+            linewidth=1.4,
+            label="Adjusted mean",
+        ),
+    ]
+    if units != "bp":
+        line_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=colors["all"],
+                linestyle="--",
+                linewidth=1.4,
+                label="True error rate (all haplotypes)",
+            )
+        )
+    legend_handles.extend(line_handles)
+    fig.legend(
+        handles=legend_handles,
+        loc="center left",
+        bbox_to_anchor=(0.99, 0.5),
+        frameon=False,
+    )
+    fig.subplots_adjust(right=0.84)
+    plt.show()
+    return fig, axes
+
+
+def plot_genotype_coverage(meta_df, real_meta_df=None):
+    meta = pd.DataFrame(meta_df, copy=False)
+    required_cols = {
+        "width",
+        "error",
+        "genotype_coverage",
+        "genotype_prop_duplicate",
+    }
+    missing_cols = required_cols.difference(meta.columns)
+    if missing_cols:
+        raise ValueError(f"meta_df is missing columns: {sorted(missing_cols)}")
+
+    plot_df = meta.loc[meta["error"] == "enabled"].copy()
+    if len(plot_df) == 0:
+        raise ValueError("No rows found with error == 'enabled'")
+    plot_df["dataset"] = "simulated"
+    plot_df = plot_df[
+        ["width", "dataset", "genotype_coverage", "genotype_prop_duplicate"]
+    ]
+
+    if real_meta_df is not None:
+        real_meta = pd.DataFrame(real_meta_df, copy=False)
+        real_required_cols = {
+            "width",
+            "genotype_coverage",
+            "genotype_prop_duplicate",
+        }
+        missing_real_cols = real_required_cols.difference(real_meta.columns)
+        if missing_real_cols:
+            raise ValueError(
+                f"real_meta_df is missing columns: {sorted(missing_real_cols)}"
+            )
+        if "dataset" not in real_meta.columns:
+            real_meta = real_meta.copy()
+            real_meta["dataset"] = "real"
+        real_meta = real_meta[
+            ["width", "dataset", "genotype_coverage", "genotype_prop_duplicate"]
+        ]
+        plot_df = pd.concat([plot_df, real_meta], ignore_index=True)
+
+    widths = _sorted_values(plot_df["width"].dropna())
+    datasets = ["simulated"] + [
+        dataset
+        for dataset in _sorted_values(plot_df["dataset"].dropna())
+        if dataset != "simulated"
+    ]
+    plot_df["width"] = pd.Categorical(
+        plot_df["width"],
+        categories=widths,
+        ordered=True,
+    )
+    plot_df["dataset"] = pd.Categorical(
+        plot_df["dataset"],
+        categories=datasets,
+        ordered=True,
+    )
+    plot_df = (
+        plot_df.groupby(["width", "dataset"], observed=False)
+        .mean(numeric_only=True)
+        .reset_index()
+        .sort_values(["width", "dataset"])
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharex=False)
+    specs = [
+        ("genotype_coverage", "Proportion of genotype matrix covered"),
+        ("genotype_prop_duplicate", "Proportion of duplicated haplotypes"),
+    ]
+    x = np.arange(len(widths), dtype=float)
+    bar_width = 0.8 / max(len(datasets), 1)
+    offsets = (
+        np.arange(len(datasets), dtype=float) - (len(datasets) - 1) / 2
+    ) * bar_width
+    palette = {"simulated": "#4c78a8"}
+    real_palette = sns.color_palette("Set2", n_colors=max(len(datasets) - 1, 0))
+    palette.update(dict(zip(datasets[1:], real_palette)))
+
+    for ax, (column, ylabel) in zip(axes, specs):
+        for dataset_idx, dataset in enumerate(datasets):
+            dataset_df = (
+                plot_df.loc[plot_df["dataset"] == dataset]
+                .set_index("width")
+                .reindex(widths)
+            )
+            ax.bar(
+                x + offsets[dataset_idx],
+                dataset_df[column].to_numpy(dtype=np.float64, copy=False),
+                width=bar_width,
+                color=palette[dataset],
+                edgecolor="white",
+                linewidth=0.5,
+                label=dataset,
+            )
+        ax.set_xlabel("Width")
+        ax.set_ylabel(ylabel)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(width) for width in widths])
+        ax.set_ylim(bottom=0)
+        ax.legend(frameon=False)
+
+    fig.tight_layout()
+    plt.show()
+    return fig, axes
 
 
 def _plot_log10_violin_boxplot(
