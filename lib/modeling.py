@@ -335,7 +335,7 @@ def _tree_sequence_genotypes(ts):
     return genotype_matrix.reshape(genotype_matrix.shape[0], ts.num_samples // 2, 2)
 
 
-def count_haplotype_matches(ts, windows):
+def count_haplotype_matches(ts, window_sizes):
     """
     Count haplotype mismatches around doubletons in a tree sequence.
     """
@@ -345,22 +345,22 @@ def count_haplotype_matches(ts, windows):
     sample_mask = np.zeros(G.shape[1], dtype=bool)
 
     dfs = []
-    assert len(windows) > 0
-    for window_size in windows:
+    assert len(window_sizes) > 0
+    for window in window_sizes:
         df, _, _ = mismatch.count_haplotype_mismatches(
             G,
             G_error_mask,
             sites_position,
             sample_mask,
-            window_size,
+            window,
         )
-        df["window_size"] = window_size
+        df["window_size"] = window
         dfs.append(df)
 
     return pd.concat(dfs)
 
 
-def expected_hap_differences_lomax(alpha, beta, pi, L, r):
+def expected_hap_differences_gamma(alpha, beta, pi, L, r):
     return pi * (
         L
         - beta
@@ -379,11 +379,9 @@ def expected_hap_differences_lognormal(mu, sigma, pi, L, r, n_quad=32):
     return pi*(L - surv_int)
 
 
-def fit_error_rate(dbtn_df, ts_dict, windows, n, r=1e-8):
+def fit_error_rate(dbtn_df, ts_dict, window_sizes, n, r=1e-8):
     ts = ts_dict[n]
-    windows = list(windows)
-
-    mm_df = count_haplotype_matches(ts, windows)
+    mm_df = count_haplotype_matches(ts, window_sizes)
     gamma_df = estimate_gamma(dbtn_df)
     lognormal_df = estimate_lognormal(dbtn_df)
     gamma_row = gamma_df.loc[gamma_df.n == n]
@@ -403,14 +401,14 @@ def fit_error_rate(dbtn_df, ts_dict, windows, n, r=1e-8):
     observed = mm_df.groupby("window_size", sort=False)["obs_error_rate_per_bp"].mean()
 
     records = []
-    for window_size in windows:
-        L = window_size / 2
-        lomax_prediction = expected_hap_differences_lomax(alpha, beta, pi, L, r) / L
+    for window in window_sizes:
+        L = window / 2
+        gamma_prediction = expected_hap_differences_gamma(alpha, beta, pi, L, r) / L
         lognormal_prediction = (
             expected_hap_differences_lognormal(mu, sigma, pi, L, r) / L
         )
         records.append({
-            "window_size": window_size,
+            "window_size": window,
             "L": L,
             "n": n,
             "alpha": alpha,
@@ -421,10 +419,10 @@ def fit_error_rate(dbtn_df, ts_dict, windows, n, r=1e-8):
             "lognormal_fitted_mean": lognormal_fitted_mean,
             "pi": pi,
             "r": r,
-            "predicted_error_rate_per_bp": lomax_prediction,
-            "predicted_lomax_error_rate_per_bp": lomax_prediction,
+            "predicted_error_rate_per_bp": gamma_prediction,
+            "predicted_gamma_error_rate_per_bp": gamma_prediction,
             "predicted_lognormal_error_rate_per_bp": lognormal_prediction,
-            "observed_error_rate_per_bp": observed.get(window_size, np.nan),
+            "observed_error_rate_per_bp": observed.get(window, np.nan),
         })
     fit_df = pd.DataFrame.from_records(records)
     return gamma_df, lognormal_df, mm_df, fit_df
@@ -856,7 +854,7 @@ def plot_error_rate_fit(fit_df):
     fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
     ax.plot(
         fit_df["window_size"],
-        fit_df["predicted_lomax_error_rate_per_bp"],
+        fit_df["predicted_gamma_error_rate_per_bp"],
         marker="o",
         color="red",
         label="Lomax",

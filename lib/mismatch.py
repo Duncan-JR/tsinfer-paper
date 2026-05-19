@@ -45,15 +45,15 @@ def match_ancestors_with_subsample(zarr_path, sample_mask=None, num_threads=190)
 
 
 
-def _get_subset_doubletons(G, sites_position, sample_mask, width):
+def _get_subset_doubletons(G, sites_position, sample_mask, window):
     subset_samples = np.flatnonzero(~sample_mask)
 
     ac = G[:, subset_samples, :].sum(axis=(1, 2))
     dbtn_sites = np.where(ac == 2)[0]
     dbtn_pos = sites_position[dbtn_sites]
 
-    left_pos = dbtn_pos - width / 2
-    right_pos = dbtn_pos + width / 2
+    left_pos = dbtn_pos - window / 2
+    right_pos = dbtn_pos + window / 2
     left_site = np.searchsorted(sites_position, left_pos, side="left")
     right_site = np.searchsorted(sites_position, right_pos, side="right")
 
@@ -109,6 +109,13 @@ def _recombination_rate_to_dist(rho, positions):
         return np.diff(positions) * rho
 
 
+def _recombination_cumsum(rho, positions):
+    try:
+        return rho.get_cumulative_mass(positions)
+    except AttributeError:
+        return positions * rho
+
+
 def _site_recombination_cumsum(sites_position, hapmap_path, chrom):
     recomb_map = _hapmap_file(hapmap_path, chrom)
     rate_map = msprime.RateMap.read_hapmap(recomb_map, position_col=1, rate_col=2)
@@ -124,8 +131,8 @@ def _empty_hmm_df():
         columns=[
             "match_left",
             "match_right",
-            "match_pos_width",
-            "match_site_width",
+            "match_pos_window",
+            "match_site_window",
             "num_mismatches",
             "mismatch_rate",
         ]
@@ -136,7 +143,7 @@ def _empty_hmm_df():
 def count_hmm_mismatches(
     zarr_path,
     sample_mask,    
-    width,
+    window,
     rho=1e-8,
     mu=1e-3,
     num_threads=190,
@@ -173,16 +180,21 @@ def count_hmm_mismatches(
 
         task_site_pos = np.repeat(np.asarray(dbtn_pos), 2)
         task_sample_id = np.asarray(dbtn_carriers, dtype=np.int32)
-        left_pos = task_site_pos - width / 2
-        right_pos = task_site_pos + width / 2
+        left_pos = task_site_pos - window / 2
+        right_pos = task_site_pos + window / 2
     else:
         if ds is None:
             ds = sgkit.load_dataset(zarr_path)
+        G = ds.call_genotype.values
+        sites_position = ds.variant_position.values
+        if global_non_singleton_mask is not None:
+            G = G[global_non_singleton_mask]
+            sites_position = sites_position[global_non_singleton_mask]
         doubleton_data = _get_subset_doubletons(
-            ds,
+            G,
+            sites_position,
             sample_mask,
-            width,
-            global_non_singleton_mask=global_non_singleton_mask,
+            window,
         )
         if len(doubleton_data["dbtn_pos"]) == 0:
             return _empty_hmm_df()
@@ -259,8 +271,8 @@ def count_hmm_mismatches(
             "focal_position": task_site_pos,
             "match_left": ancestors_sites_pos[task_left],
             "match_right": ancestors_sites_pos[task_right - 1],
-            "match_pos_width": ancestors_sites_pos[task_right - 1] - ancestors_sites_pos[task_left],
-            "match_site_width": task_right - task_left,
+            "match_pos_window": ancestors_sites_pos[task_right - 1] - ancestors_sites_pos[task_left],
+            "match_site_window": task_right - task_left,
             "num_mismatches": mismatch_counts,
         }
     )
@@ -268,16 +280,16 @@ def count_hmm_mismatches(
         {
             "match_left": "first",
             "match_right": "first",
-            "match_pos_width": "first",
-            "match_site_width": "first",
+            "match_pos_window": "first",
+            "match_site_window": "first",
             "num_mismatches": "sum",
         }
     )
     hmm_df["mismatch_rate"] = np.divide(
         hmm_df["num_mismatches"],
-        hmm_df["match_site_width"],
+        hmm_df["match_site_window"],
         out=np.zeros(len(hmm_df), dtype=float),
-        where=hmm_df["match_site_width"].to_numpy() > 0,
+        where=hmm_df["match_site_window"].to_numpy() > 0,
     )
     hmm_df.index.name = "focal_position"
     return hmm_df
@@ -287,7 +299,7 @@ def count_haplotype_mismatches(
     G_error_mask,
     sites_position,
     sample_mask,
-    width,
+    window,
     hapmap_path="../data/HapMapII_GRCh38",
     chrom="chr20",
 ):
@@ -295,7 +307,7 @@ def count_haplotype_mismatches(
         G,
         sites_position,
         sample_mask,
-        width,
+        window,
     )
 
     dbtns = doubleton_data["dbtn_pos"]
@@ -316,14 +328,21 @@ def count_haplotype_mismatches(
     num_fn_errors = np.zeros(num_dbtns, dtype=np.int32)
     num_fp_errors = np.zeros(num_dbtns, dtype=np.int32)
     num_tn_errors = np.zeros(num_dbtns, dtype=np.int32)
-    recomb_width = np.zeros(num_dbtns, dtype=np.float64)
     tpr = np.full(num_dbtns, np.nan, dtype=float)
     fpr = np.full(num_dbtns, np.nan, dtype=float)
     site_true_errors = np.zeros((num_sites, num_samples, 2), dtype=np.int32)
     G_cov = np.zeros((num_sites, num_samples, 2), dtype=np.int32)
     site_obs_errors = np.zeros(num_sites, dtype=np.int32)
     G_error_select = ~G_error_mask
-    recomb_cumsum = _site_recombination_cumsum(sites_position, hapmap_path, chrom)
+    recomb_map = _hapmap_file(hapmap_path, chrom)
+    rate_map = msprime.RateMap.read_hapmap(recomb_map, position_col=1, rate_col=2)
+    left_D = _recombination_cumsum(rate_map, left_pos)
+    dbtn_D = _recombination_cumsum(rate_map, dbtns)
+    right_D = _recombination_cumsum(rate_map, right_pos)
+    D_left = dbtn_D - left_D
+    D_right = right_D - dbtn_D
+    D_window = D_left + D_right
+    
     for i in tqdm(range(num_dbtns), desc="Haplotype mismatches", leave=False):
         left = left_site[i]
         right = right_site[i]
@@ -331,11 +350,6 @@ def count_haplotype_mismatches(
         ploidies = dbtn_ploidies[i]
         region = slice(left,right)
         hap_site_count[i] = right - left
-        recomb_width[i] = (
-            recomb_cumsum[right - 1] - recomb_cumsum[left]
-            if right > left + 1
-            else 0
-        )
         local_haps = G[region, samples, ploidies]
         G_cov[region, samples, ploidies] += 1
         true_error_select_full = G_error_select[
@@ -370,12 +384,14 @@ def count_haplotype_mismatches(
             "obs_error_rate": num_obs_errors/(hap_site_count*2),
             "true_error_rate": num_true_errors/(hap_site_count*2),
             "obs_error_rate_per_bp": (
-                num_obs_errors / width if width > 0 else np.nan
+                num_obs_errors / window if window > 0 else np.nan
             ),
             "true_error_rate_per_bp": (
-                num_true_errors / width if width > 0 else np.nan
+                num_true_errors / window if window > 0 else np.nan
             ),
-            "recomb_width": recomb_width,
+            "D_left": D_left,
+            "D_right": D_right,
+            "D_window": D_window,
             "num_tp_errors": num_tp_errors,
             "num_fn_errors": num_fn_errors,
             "num_fp_errors": num_fp_errors,
@@ -406,7 +422,7 @@ def load_ancestor_df(prefix, error, old_sim=False):
 
 def measure_mismatches(prefix,
                        subset_sizes,
-                       widths,
+                       window_sizes,
                        seed=1,
                        include_hmm=False,
                        include_anc_df=False,
@@ -426,7 +442,7 @@ def measure_mismatches(prefix,
     meta_rows = []
     meta_df = pd.DataFrame(
         columns=[
-            "width",
+            "window_size",
             "subset_size",
             "error",
             "true_error_rate_per_site",
@@ -447,8 +463,8 @@ def measure_mismatches(prefix,
             sample_mask=None,
         )
 
-    for width in tqdm(widths, desc="Widths"):
-        for n in tqdm(subset_sizes, desc=f"Subset sizes (width={width})", leave=False):
+    for window in tqdm(window_sizes, desc="Windows"):
+        for n in tqdm(subset_sizes, desc=f"Subset sizes (window={window})", leave=False):
             sample_mask = create_sample_mask(num_samples, subset_size=n)
             for error in tqdm(["enabled", "disabled"], desc=f"Errors (n={n})", leave=False):
                 zarr_path = f"../data/anc_eval/zarr_vcfs/{prefix}-gerr_{error}-ser0-mper0.zarr"
@@ -477,7 +493,7 @@ def measure_mismatches(prefix,
                     G_error_mask,
                     sites_position,
                     sample_mask,
-                    width,
+                    window,
                     hapmap_path=hapmap_path,
                     chrom=chrom,
                 )
@@ -491,7 +507,7 @@ def measure_mismatches(prefix,
                 #     hmm_df = count_hmm_mismatches(
                 #         zarr_path,
                 #         sample_mask,
-                #         width,
+                #         window,
                 #         vdata=hmm_vdata,
                 #         ancestors_ts=hmm_ancestors_ts,
                 #         ds=ds,
@@ -499,13 +515,13 @@ def measure_mismatches(prefix,
                 #     )
                 #     df = df.join(hmm_df, how="left")
 
-                df["width"] = width
+                df["window_size"] = window
                 df["sample_size"] = n
                 df["genotyping_error"] = error
                 dfs.append(df)
                 meta_rows.append(
                     {
-                        "width": width,
+                        "window_size": window,
                         "subset_size": n,
                         "error": error,
                         "true_error_rate_per_site": true_error_rate_per_site,
