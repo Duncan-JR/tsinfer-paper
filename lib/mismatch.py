@@ -340,9 +340,13 @@ def count_haplotype_mismatches(
             position_col=1,
             rate_col=2,
         )
-        left_D = _recombination_cumsum(rate_map, left_pos)
-        dbtn_D = _recombination_cumsum(rate_map, dbtns)
-        right_D = _recombination_cumsum(rate_map, right_pos)
+        map_length = rate_map.sequence_length
+        clipped_left_pos = np.clip(left_pos, 0, map_length)
+        clipped_dbtns = np.clip(dbtns, 0, map_length)
+        clipped_right_pos = np.clip(right_pos, 0, map_length)
+        left_D = _recombination_cumsum(rate_map, clipped_left_pos)
+        dbtn_D = _recombination_cumsum(rate_map, clipped_dbtns)
+        right_D = _recombination_cumsum(rate_map, clipped_right_pos)
         D_left = dbtn_D - left_D
         D_right = right_D - dbtn_D
     D_window = D_left + D_right

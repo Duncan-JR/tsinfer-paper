@@ -369,15 +369,17 @@ def expected_hap_differences_gamma(alpha, beta, pi, L, r):
     L = float(L)
     r = np.asarray(r, dtype=float)
     rate = 2 * r
-    expected = np.zeros_like(rate, dtype=float)
-    mask = rate > 0
-    expected[mask] = pi * (
+    p_recomb = 1 - (1 + rate * L / beta) ** (-alpha)
+    expected = pi * (
         L
         - beta
-        / (rate[mask] * (alpha - 1))
-        * (1 - (1 + rate[mask] * L / beta) ** (1 - alpha))
+        / (rate * (alpha - 1))
+        * (1 - (1 + rate * L / beta) ** (1 - alpha))
     )
-    return expected.item() if expected.ndim == 0 else expected
+    if expected.ndim == 0:
+        return expected.item(), p_recomb.item()
+    return expected, p_recomb
+
 
 def expected_hap_differences_lognormal(mu, sigma, pi, L, r, n_quad=32):
     nodes, weights = hermgauss(n_quad)
@@ -387,16 +389,14 @@ def expected_hap_differences_lognormal(mu, sigma, pi, L, r, n_quad=32):
     L = float(L)
     r = np.asarray(r, dtype=float)
     rate = 2 * r[..., np.newaxis] * t
-    values = np.divide(
-        -np.expm1(-L * rate),
-        rate,
-        out=np.full(rate.shape, L, dtype=float),
-        where=rate > 0,
-    )
+    p_values = -np.expm1(-L * rate)
+    values = p_values / rate
     surv_int = np.sum(weights * values, axis=-1) / np.sqrt(np.pi)
+    p_recomb = np.sum(weights * p_values, axis=-1) / np.sqrt(np.pi)
     expected = pi * (L - surv_int)
-    expected = np.where(r > 0, expected, 0.0)
-    return expected.item() if expected.ndim == 0 else expected
+    if expected.ndim == 0:
+        return expected.item(), p_recomb.item()
+    return expected, p_recomb
 
 
 def fit_error_rate(dbtn_df, ts_dict, window_sizes, n, r):
@@ -418,9 +418,15 @@ def fit_error_rate(dbtn_df, ts_dict, window_sizes, n, r):
     records = []
     for window in window_sizes:
         L = window / 2
-        gamma_prediction = expected_hap_differences_gamma(alpha, beta, pi, L, r) / L
-        lognormal_prediction = (
-            expected_hap_differences_lognormal(mu, sigma, pi, L, r) / L
+        gamma_differences, gamma_p_recomb = expected_hap_differences_gamma(
+            alpha,
+            beta,
+            pi,
+            L,
+            r,
+        )
+        lognormal_differences, lognormal_p_recomb = (
+            expected_hap_differences_lognormal(mu, sigma, pi, L, r)
         )
         records.append({
             "window_size": window,
@@ -434,8 +440,12 @@ def fit_error_rate(dbtn_df, ts_dict, window_sizes, n, r):
             "lognormal_fitted_mean": lognormal_fitted_mean,
             "pi": pi,
             "r": r,
-            "pred_gamma_error_rate_per_bp": gamma_prediction,
-            "pred_lognormal_error_rate_per_bp": lognormal_prediction,
+            "pred_gamma_differences": 2 * gamma_differences,
+            "pred_lognormal_differences": 2 * lognormal_differences,
+            "pred_gamma_error_rate_per_bp": gamma_differences / L,
+            "pred_lognormal_error_rate_per_bp": lognormal_differences / L,
+            "pred_gamma_p_recomb": 2 * gamma_p_recomb - gamma_p_recomb**2,
+            "pred_lognormal_p_recomb": 2 * lognormal_p_recomb - lognormal_p_recomb**2,
             "observed_error_rate_per_bp": observed.get(window, np.nan),
         })
     fit_df = pd.DataFrame.from_records(records)
@@ -461,34 +471,37 @@ def fit_error_rate_map(dbtn_df, ts_dict, window_sizes, n, recomb_map):
     mm_df["pred_lognormal_differences"] = np.nan
     mm_df["pred_gamma_error_rate_per_bp"] = np.nan
     mm_df["pred_lognormal_error_rate_per_bp"] = np.nan
+    mm_df["pred_gamma_p_recomb"] = np.nan
+    mm_df["pred_lognormal_p_recomb"] = np.nan
 
     for window_size, index in mm_df.groupby("window_size", sort=False).groups.items():
         L = window_size / 2
         D = mm_df.loc[index, ["D_left", "D_right"]].to_numpy(dtype=float)
-        r = np.divide(
-            D,
-            L,
-            out=np.zeros_like(D, dtype=float),
-            where=L > 0,
-        )
-        gamma_differences = expected_hap_differences_gamma(
+        r = D / L
+        gamma_differences, gamma_p_recomb = expected_hap_differences_gamma(
             alpha,
             beta,
             pi,
             L,
             r,
-        ).sum(axis=1)
-        lognormal_differences = expected_hap_differences_lognormal(
+        )
+        lognormal_differences, lognormal_p_recomb = expected_hap_differences_lognormal(
             mu,
             sigma,
             pi,
             L,
             r,
-        ).sum(axis=1)
+        )
+        gamma_differences = gamma_differences.sum(axis=1)
+        lognormal_differences = lognormal_differences.sum(axis=1)
+        gamma_p_recomb = gamma_p_recomb.sum(axis=1) - gamma_p_recomb.prod(axis=1)
+        lognormal_p_recomb = lognormal_p_recomb.sum(axis=1) - lognormal_p_recomb.prod(axis=1)
         mm_df.loc[index, "left_recomb_rate"] = r[:, 0]
         mm_df.loc[index, "right_recomb_rate"] = r[:, 1]
         mm_df.loc[index, "pred_gamma_differences"] = gamma_differences
         mm_df.loc[index, "pred_lognormal_differences"] = lognormal_differences
+        mm_df.loc[index, "pred_gamma_p_recomb"] = gamma_p_recomb
+        mm_df.loc[index, "pred_lognormal_p_recomb"] = lognormal_p_recomb
         if window_size > 0:
             mm_df.loc[index, "pred_gamma_error_rate_per_bp"] = (
                 gamma_differences / window_size
@@ -921,11 +934,14 @@ def plot_multifit(df, var="T_mrca"):
     plt.show()
 
 
-def plot_error_rate_fit(fit_df, ax=None):
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
+def plot_error_rate_fit(fit_df, ax=None, p_ax=None):
+    if ax is None and p_ax is None:
+        fig, (ax, p_ax) = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
+    elif ax is None or p_ax is None:
+        raise ValueError("ax and p_ax must be provided together")
     else:
         fig = ax.figure
+
     ax.plot(
         fit_df["window_size"],
         fit_df["pred_gamma_error_rate_per_bp"],
@@ -952,7 +968,26 @@ def plot_error_rate_fit(fit_df, ax=None):
     ax.set_xlabel("Window size")
     ax.set_ylabel("Error rate per bp")
     ax.legend()
-    return fig, ax
+
+    p_ax.plot(
+        fit_df["window_size"],
+        fit_df["pred_gamma_p_recomb"],
+        marker="o",
+        color="red",
+        label="Lomax",
+    )
+    p_ax.plot(
+        fit_df["window_size"],
+        fit_df["pred_lognormal_p_recomb"],
+        marker="o",
+        color="tab:blue",
+        label="Lognormal",
+    )
+    p_ax.set_xscale("log")
+    p_ax.set_xlabel("Window size")
+    p_ax.set_ylabel("Probability(recombination)")
+    p_ax.legend()
+    return fig, (ax, p_ax)
 
 
 def plot_error_rate_map(df):
@@ -961,6 +996,8 @@ def plot_error_rate_map(df):
         "observed_error_rate_per_bp",
         "pred_gamma_error_rate_per_bp",
         "pred_lognormal_error_rate_per_bp",
+        "pred_gamma_p_recomb",
+        "pred_lognormal_p_recomb",
     }
     missing_cols = required_cols.difference(df.columns)
     if missing_cols:
@@ -996,7 +1033,7 @@ def plot_error_rate_map(df):
         wspace=0.2,
         hspace=0.32,
     )
-    bottom_grid = outer_grid[1].subgridspec(1, 3, wspace=0.28)
+    bottom_grid = outer_grid[1].subgridspec(1, 4, wspace=0.28)
 
     def _finite_values(values):
         values = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(
@@ -1098,12 +1135,15 @@ def plot_error_rate_map(df):
                 "observed_error_rate_per_bp",
                 "pred_gamma_error_rate_per_bp",
                 "pred_lognormal_error_rate_per_bp",
+                "pred_gamma_p_recomb",
+                "pred_lognormal_p_recomb",
             ]
         ]
         .mean()
         .reset_index()
     )
     ax = fig.add_subplot(bottom_grid[0, 2])
-    plot_error_rate_fit(mean_fit_df, ax=ax)
+    p_ax = fig.add_subplot(bottom_grid[0, 3])
+    plot_error_rate_fit(mean_fit_df, ax=ax, p_ax=p_ax)
 
     plt.show()
