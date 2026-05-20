@@ -9,9 +9,10 @@ def simulate(model, contig, samples, left, right, seed):
     contig = species.get_contig(
         contig,
         mutation_rate=0,
+        recombination_rate=1e-8,
         left=float(left),
         right=float(right),
-        genetic_map="HapMapII_GRCh38",
+     #   genetic_map="HapMapII_GRCh38",
     )
     engine = stdpopsim.get_engine("msprime")
     with warnings.catch_warnings():

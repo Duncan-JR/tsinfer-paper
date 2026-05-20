@@ -329,18 +329,22 @@ def run_simulations(sample_sizes, N_e, seq_length=1e6, rate=1e-8):
 
 
 def _tree_sequence_genotypes(ts):
-    genotype_matrix = np.asarray(ts.genotype_matrix(), dtype=np.int8)
-    if ts.num_samples % 2 != 0:
-        raise ValueError("Tree sequence must have an even number of sample nodes")
-    return genotype_matrix.reshape(genotype_matrix.shape[0], ts.num_samples // 2, 2)
+    G = np.asarray(ts.genotype_matrix(), dtype=np.int8)
+    return G.reshape(G.shape[0], ts.num_samples // 2, 2)
 
 
-def count_haplotype_matches(ts, window_sizes):
+def count_haplotype_matches(
+    ts,
+    window_sizes,
+    recomb_map=None,
+):
     """
     Count haplotype mismatches around doubletons in a tree sequence.
     """
-    G = _tree_sequence_genotypes(ts)
-    sites_position = ts.sites_position
+    G_full = _tree_sequence_genotypes(ts)
+    singleton_mask = np.sum(G_full, axis=(1, 2)) > 1
+    G = G_full[singleton_mask, :, :]
+    sites_position = ts.sites_position[singleton_mask]
     G_error_mask = np.ones_like(G, dtype=bool)
     sample_mask = np.zeros(G.shape[1], dtype=bool)
 
@@ -353,6 +357,7 @@ def count_haplotype_matches(ts, window_sizes):
             sites_position,
             sample_mask,
             window,
+            recomb_map=recomb_map,
         )
         df["window_size"] = window
         dfs.append(df)
@@ -361,36 +366,46 @@ def count_haplotype_matches(ts, window_sizes):
 
 
 def expected_hap_differences_gamma(alpha, beta, pi, L, r):
-    return pi * (
+    L = float(L)
+    r = np.asarray(r, dtype=float)
+    rate = 2 * r
+    expected = np.zeros_like(rate, dtype=float)
+    mask = rate > 0
+    expected[mask] = pi * (
         L
         - beta
-        / (2 * r * (alpha - 1))
-        * (1 - (1 + 2 * r * L / beta) ** (1 - alpha))
+        / (rate[mask] * (alpha - 1))
+        * (1 - (1 + rate[mask] * L / beta) ** (1 - alpha))
     )
+    return expected.item() if expected.ndim == 0 else expected
 
 def expected_hap_differences_lognormal(mu, sigma, pi, L, r, n_quad=32):
     nodes, weights = hermgauss(n_quad)
 
     # Convert Hermite nodes for exp(-x^2) to standard normal nodes.
     t = np.exp(mu + sigma * np.sqrt(2) * nodes)
-    rate = 2 * r * t
-    values = -np.expm1(-L * rate) / rate
-    surv_int = np.sum(weights * values) / np.sqrt(np.pi)
-    return pi*(L - surv_int)
+    L = float(L)
+    r = np.asarray(r, dtype=float)
+    rate = 2 * r[..., np.newaxis] * t
+    values = np.divide(
+        -np.expm1(-L * rate),
+        rate,
+        out=np.full(rate.shape, L, dtype=float),
+        where=rate > 0,
+    )
+    surv_int = np.sum(weights * values, axis=-1) / np.sqrt(np.pi)
+    expected = pi * (L - surv_int)
+    expected = np.where(r > 0, expected, 0.0)
+    return expected.item() if expected.ndim == 0 else expected
 
 
-def fit_error_rate(dbtn_df, ts_dict, window_sizes, n, r=1e-8):
+def fit_error_rate(dbtn_df, ts_dict, window_sizes, n, r):
     ts = ts_dict[n]
     mm_df = count_haplotype_matches(ts, window_sizes)
     gamma_df = estimate_gamma(dbtn_df)
     lognormal_df = estimate_lognormal(dbtn_df)
     gamma_row = gamma_df.loc[gamma_df.n == n]
-    if len(gamma_row) != 1:
-        raise ValueError(f"Expected exactly one gamma fit for n={n}")
     lognormal_row = lognormal_df.loc[lognormal_df.n == n]
-    if len(lognormal_row) != 1:
-        raise ValueError(f"Expected exactly one lognormal fit for n={n}")
-
     alpha = float(gamma_row["alpha"].iloc[0])
     beta = float(gamma_row["beta"].iloc[0])
     mu = float(lognormal_row["mu"].iloc[0])
@@ -419,13 +434,69 @@ def fit_error_rate(dbtn_df, ts_dict, window_sizes, n, r=1e-8):
             "lognormal_fitted_mean": lognormal_fitted_mean,
             "pi": pi,
             "r": r,
-            "predicted_error_rate_per_bp": gamma_prediction,
-            "predicted_gamma_error_rate_per_bp": gamma_prediction,
-            "predicted_lognormal_error_rate_per_bp": lognormal_prediction,
+            "pred_gamma_error_rate_per_bp": gamma_prediction,
+            "pred_lognormal_error_rate_per_bp": lognormal_prediction,
             "observed_error_rate_per_bp": observed.get(window, np.nan),
         })
     fit_df = pd.DataFrame.from_records(records)
-    return gamma_df, lognormal_df, mm_df, fit_df
+    return mm_df, fit_df
+
+
+def fit_error_rate_map(dbtn_df, ts_dict, window_sizes, n, recomb_map):
+    ts = ts_dict[n]
+    mm_df = count_haplotype_matches(ts, window_sizes, recomb_map=recomb_map)
+    gamma_df = estimate_gamma(dbtn_df)
+    lognormal_df = estimate_lognormal(dbtn_df)
+    gamma_row = gamma_df.loc[gamma_df.n == n]
+    lognormal_row = lognormal_df.loc[lognormal_df.n == n]
+    alpha = float(gamma_row["alpha"].iloc[0])
+    beta = float(gamma_row["beta"].iloc[0])
+    mu = float(lognormal_row["mu"].iloc[0])
+    sigma = float(lognormal_row["sigma"].iloc[0])
+    pi = ts.diversity()
+
+    mm_df = mm_df.copy()
+    mm_df["observed_error_rate_per_bp"] = mm_df["obs_error_rate_per_bp"]
+    mm_df["pred_gamma_differences"] = np.nan
+    mm_df["pred_lognormal_differences"] = np.nan
+    mm_df["pred_gamma_error_rate_per_bp"] = np.nan
+    mm_df["pred_lognormal_error_rate_per_bp"] = np.nan
+
+    for window_size, index in mm_df.groupby("window_size", sort=False).groups.items():
+        L = window_size / 2
+        D = mm_df.loc[index, ["D_left", "D_right"]].to_numpy(dtype=float)
+        r = np.divide(
+            D,
+            L,
+            out=np.zeros_like(D, dtype=float),
+            where=L > 0,
+        )
+        gamma_differences = expected_hap_differences_gamma(
+            alpha,
+            beta,
+            pi,
+            L,
+            r,
+        ).sum(axis=1)
+        lognormal_differences = expected_hap_differences_lognormal(
+            mu,
+            sigma,
+            pi,
+            L,
+            r,
+        ).sum(axis=1)
+        mm_df.loc[index, "left_recomb_rate"] = r[:, 0]
+        mm_df.loc[index, "right_recomb_rate"] = r[:, 1]
+        mm_df.loc[index, "pred_gamma_differences"] = gamma_differences
+        mm_df.loc[index, "pred_lognormal_differences"] = lognormal_differences
+        if window_size > 0:
+            mm_df.loc[index, "pred_gamma_error_rate_per_bp"] = (
+                gamma_differences / window_size
+            )
+            mm_df.loc[index, "pred_lognormal_error_rate_per_bp"] = (
+                lognormal_differences / window_size
+            )
+    return mm_df
 
 
 def plot_doubleton_ages(df, var="T_mrca"):
@@ -850,18 +921,21 @@ def plot_multifit(df, var="T_mrca"):
     plt.show()
 
 
-def plot_error_rate_fit(fit_df):
-    fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
+def plot_error_rate_fit(fit_df, ax=None):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
+    else:
+        fig = ax.figure
     ax.plot(
         fit_df["window_size"],
-        fit_df["predicted_gamma_error_rate_per_bp"],
+        fit_df["pred_gamma_error_rate_per_bp"],
         marker="o",
         color="red",
         label="Lomax",
     )
     ax.plot(
         fit_df["window_size"],
-        fit_df["predicted_lognormal_error_rate_per_bp"],
+        fit_df["pred_lognormal_error_rate_per_bp"],
         marker="o",
         color="tab:blue",
         label="Lognormal",
@@ -879,3 +953,157 @@ def plot_error_rate_fit(fit_df):
     ax.set_ylabel("Error rate per bp")
     ax.legend()
     return fig, ax
+
+
+def plot_error_rate_map(df):
+    required_cols = {
+        "window_size",
+        "observed_error_rate_per_bp",
+        "pred_gamma_error_rate_per_bp",
+        "pred_lognormal_error_rate_per_bp",
+    }
+    missing_cols = required_cols.difference(df.columns)
+    if missing_cols:
+        raise ValueError(f"df is missing columns: {sorted(missing_cols)}")
+
+    frame = pd.DataFrame(df, copy=False)
+    window_sizes = sorted(frame["window_size"].dropna().unique())
+    if len(window_sizes) == 0:
+        raise ValueError("df must contain at least one window size")
+
+    distribution_specs = [
+        ("Observed", "observed_error_rate_per_bp", "0.25"),
+        ("Lognormal", "pred_lognormal_error_rate_per_bp", "tab:blue"),
+        ("Gamma", "pred_gamma_error_rate_per_bp", "red"),
+    ]
+    scatter_specs = [
+        ("Gamma", "pred_gamma_error_rate_per_bp", "red"),
+        ("Lognormal", "pred_lognormal_error_rate_per_bp", "tab:blue"),
+    ]
+
+    fig = plt.figure(
+        figsize=(max(4.0 * len(window_sizes), 12.0), 12.5),
+        constrained_layout=True,
+    )
+    outer_grid = fig.add_gridspec(
+        2,
+        1,
+        height_ratios=[3.0, 1.35],
+    )
+    hist_grid = outer_grid[0].subgridspec(
+        len(distribution_specs),
+        len(window_sizes),
+        wspace=0.2,
+        hspace=0.32,
+    )
+    bottom_grid = outer_grid[1].subgridspec(1, 3, wspace=0.28)
+
+    def _finite_values(values):
+        values = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(
+            dtype=float,
+            copy=False,
+        )
+        return values[np.isfinite(values) & (values >= 0)]
+
+    all_positive = []
+    for _, col, _ in distribution_specs:
+        values = _finite_values(frame[col])
+        all_positive.extend(values[values > 0])
+    all_positive = np.asarray(all_positive, dtype=float)
+    if len(all_positive) == 0:
+        positive_edges = None
+    else:
+        log_min = np.floor(np.log10(np.min(all_positive)))
+        log_max = np.ceil(np.log10(np.max(all_positive)))
+        if log_min == log_max:
+            log_min -= 0.5
+            log_max += 0.5
+        positive_edges = np.logspace(log_min, log_max, 40)
+
+    def _plot_distribution(ax, values, color):
+        values = _finite_values(values)
+        zero_count = np.count_nonzero(values == 0)
+        positive = values[values > 0]
+        if len(positive) > 0 and positive_edges is not None:
+            ax.hist(positive, bins=positive_edges, color=color, alpha=0.75)
+            ax.set_xscale("log")
+        if zero_count > 0:
+            ax.text(
+                0.98,
+                0.92,
+                f"zero = {zero_count}",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8,
+                color=color,
+            )
+        if len(positive) == 0:
+            ax.text(0.5, 0.5, "No positive values", ha="center", va="center")
+        ax.set_yscale("log")
+
+    for row, (label, col, color) in enumerate(distribution_specs):
+        for col_idx, window_size in enumerate(window_sizes):
+            ax = fig.add_subplot(hist_grid[row, col_idx])
+            values = frame.loc[frame["window_size"] == window_size, col]
+            _plot_distribution(ax, values, color)
+            if row == 0:
+                ax.set_title(f"window_size = {window_size:g}")
+            if col_idx == 0:
+                ax.set_ylabel(label)
+            if row == len(distribution_specs) - 1:
+                ax.set_xlabel("Error rate per bp")
+            else:
+                ax.set_xlabel("")
+
+    def _plot_observed_vs_fitted(ax, fitted_col, label, color):
+        x = pd.to_numeric(frame["observed_error_rate_per_bp"], errors="coerce").to_numpy(
+            dtype=float,
+            copy=False,
+        )
+        y = pd.to_numeric(frame[fitted_col], errors="coerce").to_numpy(
+            dtype=float,
+            copy=False,
+        )
+        mask = np.isfinite(x) & np.isfinite(y) & (x >= 0) & (y >= 0)
+        ax.scatter(x[mask], y[mask], s=16, color=color, alpha=0.3, linewidths=0)
+        fit_mask = mask & (x > 0) & (y > 0)
+        if np.count_nonzero(fit_mask) >= 2:
+            slope, intercept = np.polyfit(np.log10(x[fit_mask]), np.log10(y[fit_mask]), 1)
+            x_line = np.logspace(
+                np.log10(np.min(x[fit_mask])),
+                np.log10(np.max(x[fit_mask])),
+                100,
+            )
+            y_line = 10 ** (intercept + slope * np.log10(x_line))
+            ax.plot(x_line, y_line, color=color, linewidth=2)
+        positive = np.concatenate([x[mask & (x > 0)], y[mask & (y > 0)]])
+        if len(positive) > 0:
+            lo = np.min(positive)
+            hi = np.max(positive)
+            ax.plot([lo, hi], [lo, hi], color="0.6", linestyle="--", linewidth=1)
+            ax.set_xscale("log")
+            ax.set_yscale("log")
+        ax.set_title(f"Observed vs {label}")
+        ax.set_xlabel("Observed error rate per bp")
+        ax.set_ylabel(f"{label} error rate per bp")
+
+    for idx, (label, col, color) in enumerate(scatter_specs):
+        ax = fig.add_subplot(bottom_grid[0, idx])
+        _plot_observed_vs_fitted(ax, col, label, color)
+
+    mean_fit_df = (
+        frame.groupby("window_size", sort=True)[
+            [
+                "observed_error_rate_per_bp",
+                "pred_gamma_error_rate_per_bp",
+                "pred_lognormal_error_rate_per_bp",
+            ]
+        ]
+        .mean()
+        .reset_index()
+    )
+    ax = fig.add_subplot(bottom_grid[0, 2])
+    plot_error_rate_fit(mean_fit_df, ax=ax)
+
+    plt.show()

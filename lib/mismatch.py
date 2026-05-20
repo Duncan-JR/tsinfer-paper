@@ -84,22 +84,17 @@ def _get_subset_doubletons(G, sites_position, sample_mask, window):
     }
 
 
-def _hapmap_file(hapmap_path, chrom):
-    filename = f"genetic_map_Hg38_{chrom}.txt"
-    path = os.path.join(hapmap_path, filename)
-    if os.path.exists(path) or os.path.isabs(hapmap_path):
-        return path
-
+def _resolve_recomb_map(recomb_map):
+    if os.path.exists(recomb_map) or os.path.isabs(recomb_map):
+        return recomb_map
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    candidates = [
-        os.path.join(repo_root, hapmap_path, filename),
-    ]
-    if hapmap_path.startswith("../"):
-        candidates.append(os.path.join(repo_root, hapmap_path[3:], filename))
+    candidates = [os.path.join(repo_root, recomb_map)]
+    if recomb_map.startswith("../"):
+        candidates.append(os.path.join(repo_root, recomb_map[3:]))
     for candidate in candidates:
         if os.path.exists(candidate):
             return candidate
-    return path
+    return candidates[0]
 
 
 def _recombination_rate_to_dist(rho, positions):
@@ -116,9 +111,12 @@ def _recombination_cumsum(rho, positions):
         return positions * rho
 
 
-def _site_recombination_cumsum(sites_position, hapmap_path, chrom):
-    recomb_map = _hapmap_file(hapmap_path, chrom)
-    rate_map = msprime.RateMap.read_hapmap(recomb_map, position_col=1, rate_col=2)
+def _site_recombination_cumsum(sites_position, recomb_map):
+    rate_map = msprime.RateMap.read_hapmap(
+        _resolve_recomb_map(recomb_map),
+        position_col=1,
+        rate_col=2,
+    )
     genetic_dists = _recombination_rate_to_dist(rate_map, sites_position)
     recomb_cumsum = np.zeros(len(sites_position), dtype=np.float64)
     if len(genetic_dists) > 0:
@@ -300,8 +298,7 @@ def count_haplotype_mismatches(
     sites_position,
     sample_mask,
     window,
-    hapmap_path="../data/HapMapII_GRCh38",
-    chrom="chr20",
+    recomb_map=None,
 ):
     doubleton_data = _get_subset_doubletons(
         G,
@@ -334,13 +331,20 @@ def count_haplotype_mismatches(
     G_cov = np.zeros((num_sites, num_samples, 2), dtype=np.int32)
     site_obs_errors = np.zeros(num_sites, dtype=np.int32)
     G_error_select = ~G_error_mask
-    recomb_map = _hapmap_file(hapmap_path, chrom)
-    rate_map = msprime.RateMap.read_hapmap(recomb_map, position_col=1, rate_col=2)
-    left_D = _recombination_cumsum(rate_map, left_pos)
-    dbtn_D = _recombination_cumsum(rate_map, dbtns)
-    right_D = _recombination_cumsum(rate_map, right_pos)
-    D_left = dbtn_D - left_D
-    D_right = right_D - dbtn_D
+    if recomb_map is None:
+        D_left = np.full(num_dbtns, np.nan, dtype=np.float64)
+        D_right = np.full(num_dbtns, np.nan, dtype=np.float64)
+    else:
+        rate_map = msprime.RateMap.read_hapmap(
+            _resolve_recomb_map(recomb_map),
+            position_col=1,
+            rate_col=2,
+        )
+        left_D = _recombination_cumsum(rate_map, left_pos)
+        dbtn_D = _recombination_cumsum(rate_map, dbtns)
+        right_D = _recombination_cumsum(rate_map, right_pos)
+        D_left = dbtn_D - left_D
+        D_right = right_D - dbtn_D
     D_window = D_left + D_right
     
     for i in tqdm(range(num_dbtns), desc="Haplotype mismatches", leave=False):
@@ -428,8 +432,7 @@ def measure_mismatches(prefix,
                        include_anc_df=False,
                        rho=0,
                        hmm_reference_error="disabled",
-                       hapmap_path="../data/HapMapII_GRCh38",
-                       chrom="chr20"):
+                       recomb_map="data/HapMapII_GRCh38/genetic_map_Hg38_chr20.txt"):
     np.random.seed(seed)
 
     zarr_path = f"../data/anc_eval/zarr_vcfs/{prefix}-gerr_disabled-ser0-mper0.zarr"
@@ -494,8 +497,7 @@ def measure_mismatches(prefix,
                     sites_position,
                     sample_mask,
                     window,
-                    hapmap_path=hapmap_path,
-                    chrom=chrom,
+                    recomb_map=recomb_map,
                 )
 
                 if include_anc_df:
