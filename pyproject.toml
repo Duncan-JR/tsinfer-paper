@@ -6,7 +6,29 @@ build-backend = "setuptools.build_meta"
 name = "tsinfer-paper"
 version = "0.0.0"
 description = "Evaluation and plotting code for tsinfer paper workflows"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
+dependencies = [
+    "click",
+    "numpy>=2",
+    "numba",
+    "tqdm",
+    "tskit>=1.0.0",
+    "zarr<3",
+    "bio2zarr",
+    "pandas",
+    "matplotlib",
+    "seaborn",
+    "msprime>=1.4.2",
+    "stdpopsim>=0.3.0",
+    "jupyterlab>=4.5.7",
+    "scipy>=1.17.1",
+    "sgkit==0.10.0",
+    "snakemake",
+    "tsinfer==0.5.1",
+    "tszip>=0.3.1",
+    "pyyaml",
+    "xarray",
+]
 
 [tool.setuptools]
 packages = ["lib"]
